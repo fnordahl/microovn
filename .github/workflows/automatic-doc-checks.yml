@@ -11,6 +11,6 @@ concurrency:
 
 jobs:
   documentation-checks:
-    uses: canonical/documentation-workflows/.github/workflows/documentation-checks.yaml@main
+    uses: fnordahl/documentation-workflows/.github/workflows/documentation-checks.yaml@upload-artifacts
     with:
       working-directory: 'docs'
