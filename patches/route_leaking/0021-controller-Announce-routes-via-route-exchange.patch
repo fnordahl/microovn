@@ -1,0 +1,350 @@
+From 5539865f4ab5f321a865a484273da1112d725c7a Mon Sep 17 00:00:00 2001
+From: Frode Nordahl <fnordahl@ubuntu.com>
+Date: Mon, 4 Nov 2024 12:04:39 +0100
+Subject: [PATCH 21/31] controller: Announce routes via route-exchange.
+
+From: Felix Huettner <felix.huettner@stackit.cloud>
+
+This engine node takes the routes from the "route" engine node and ensures
+they are written to the linux side.
+
+It is separate from the "route" engine node as it will also be used to
+learn routes in the future.
+
+Signed-off-by: Felix Huettner <felix.huettner@stackit.cloud>
+---
+ controller/automake.mk           |  7 ++-
+ controller/ovn-controller.c      | 48 +++++++++++++++-
+ controller/route-exchange-stub.c | 42 ++++++++++++++
+ controller/route-exchange.c      | 97 ++++++++++++++++++++++++++++++++
+ controller/route-exchange.h      | 33 +++++++++++
+ 5 files changed, 223 insertions(+), 4 deletions(-)
+ create mode 100644 controller/route-exchange-stub.c
+ create mode 100644 controller/route-exchange.c
+ create mode 100644 controller/route-exchange.h
+
+diff --git a/controller/automake.mk b/controller/automake.mk
+index 54855a3f9..b1bb23e78 100644
+--- a/controller/automake.mk
++++ b/controller/automake.mk
+@@ -50,13 +50,18 @@ controller_ovn_controller_SOURCES = \
+ 	controller/statctrl.c \
+ 	controller/ct-zone.h \
+ 	controller/ct-zone.c \
++	controller/route-exchange.h \
+ 	controller/route.h \
+ 	controller/route.c
+ 
+ if HAVE_NETLINK
+ controller_ovn_controller_SOURCES += \
+ 	controller/route-exchange-netlink.h \
+-	controller/route-exchange-netlink.c
++	controller/route-exchange-netlink.c \
++	controller/route-exchange.c
++else
++controller_ovn_controller_SOURCES += \
++	controller/route-exchange-stub.c
+ endif
+ 
+ controller_ovn_controller_LDADD = lib/libovn.la $(OVS_LIBDIR)/libopenvswitch.la
+diff --git a/controller/ovn-controller.c b/controller/ovn-controller.c
+index 652209ff5..3adc96960 100644
+--- a/controller/ovn-controller.c
++++ b/controller/ovn-controller.c
+@@ -88,6 +88,7 @@
+ #include "lib/dns-resolve.h"
+ #include "ct-zone.h"
+ #include "route.h"
++#include "route-exchange.h"
+ 
+ VLOG_DEFINE_THIS_MODULE(main);
+ 
+@@ -4764,6 +4765,14 @@ controller_output_bfd_chassis_handler(struct engine_node *node,
+     return true;
+ }
+ 
++static bool
++controller_output_route_exchange_handler(struct engine_node *node,
++                                         void *data OVS_UNUSED)
++{
++    engine_set_node_state(node, EN_UPDATED);
++    return true;
++}
++
+ /* Handles sbrec_chassis changes.
+  * If a new chassis is added or removed return false, so that
+  * flows are recomputed.  For any updates, there is no need for
+@@ -4941,6 +4950,36 @@ route_sb_port_binding_data_handler(struct engine_node *node, void *data)
+     return true;
+ }
+ 
++static void
++en_route_exchange_run(struct engine_node *node, void *data OVS_UNUSED)
++{
++    struct ed_type_route *route_data =
++        engine_get_input_data("route", node);
++
++    struct route_exchange_ctx_in r_ctx_in = {
++        .announce_routes = &route_data->announce_routes,
++    };
++
++    struct route_exchange_ctx_out r_ctx_out = {
++    };
++
++    route_exchange_run(&r_ctx_in, &r_ctx_out);
++
++    engine_set_node_state(node, EN_UPDATED);
++}
++
++
++static void *
++en_route_exchange_init(struct engine_node *node OVS_UNUSED,
++                       struct engine_arg *arg OVS_UNUSED)
++{
++    return NULL;
++}
++
++static void
++en_route_exchange_cleanup(void *data OVS_UNUSED)
++{}
++
+ /* Returns false if the northd internal version stored in SB_Global
+  * and ovn-controller internal version don't match.
+  */
+@@ -5235,6 +5274,7 @@ main(int argc, char *argv[])
+     ENGINE_NODE(mac_cache, "mac_cache");
+     ENGINE_NODE(bfd_chassis, "bfd_chassis");
+     ENGINE_NODE_WITH_CLEAR_TRACK_DATA(route, "route");
++    ENGINE_NODE(route_exchange, "route_exchange");
+ 
+ #define SB_NODE(NAME, NAME_STR) ENGINE_NODE_SB(NAME, NAME_STR);
+     SB_NODES
+@@ -5265,6 +5305,7 @@ main(int argc, char *argv[])
+                      route_runtime_data_handler);
+     engine_add_input(&en_route, &en_sb_route,
+                      engine_noop_handler);
++    engine_add_input(&en_route_exchange, &en_route, NULL);
+ 
+     engine_add_input(&en_addr_sets, &en_sb_address_set,
+                      addr_sets_sb_address_set_handler);
+@@ -5446,9 +5487,8 @@ main(int argc, char *argv[])
+                      controller_output_mac_cache_handler);
+     engine_add_input(&en_controller_output, &en_bfd_chassis,
+                      controller_output_bfd_chassis_handler);
+-    /* This is just temporary until the route output is actually used. */
+-    engine_add_input(&en_controller_output, &en_route,
+-                     controller_output_bfd_chassis_handler);
++    engine_add_input(&en_controller_output, &en_route_exchange,
++                     controller_output_route_exchange_handler);
+ 
+     struct engine_arg engine_arg = {
+         .sb_idl = ovnsb_idl_loop.idl,
+@@ -6166,6 +6206,7 @@ loop_done:
+ 
+             poll_block();
+         }
++        route_exchange_cleanup();
+     }
+ 
+     free(ovn_version);
+@@ -6195,6 +6236,7 @@ loop_done:
+     service_stop();
+     ovsrcu_exit();
+     dns_resolve_destroy();
++    route_exchange_destroy();
+ 
+     exit(retval);
+ }
+diff --git a/controller/route-exchange-stub.c b/controller/route-exchange-stub.c
+new file mode 100644
+index 000000000..2ca644b06
+--- /dev/null
++++ b/controller/route-exchange-stub.c
+@@ -0,0 +1,42 @@
++/*
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at:
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include <config.h>
++
++#include <stdbool.h>
++
++#include "openvswitch/compiler.h"
++#include "route-exchange.h"
++
++bool
++route_exchange_relevant_port(const struct sbrec_port_binding *pb OVS_UNUSED)
++{
++    return false;
++}
++
++void
++route_exchange_run(struct route_exchange_ctx_in *r_ctx_in OVS_UNUSED,
++                   struct route_exchange_ctx_out *r_ctx_out OVS_UNUSED)
++{
++}
++
++void
++route_exchange_cleanup(void)
++{
++}
++
++void
++route_exchange_destroy(void)
++{
++}
+diff --git a/controller/route-exchange.c b/controller/route-exchange.c
+new file mode 100644
+index 000000000..86ccc92cb
+--- /dev/null
++++ b/controller/route-exchange.c
+@@ -0,0 +1,97 @@
++/*
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at:
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include <config.h>
++
++#include <errno.h>
++#include <net/if.h>
++
++#include "openvswitch/vlog.h"
++
++#include "lib/ovn-sb-idl.h"
++
++#include "binding.h"
++#include "ha-chassis.h"
++#include "local_data.h"
++#include "route.h"
++#include "route-exchange.h"
++#include "route-exchange-netlink.h"
++
++
++VLOG_DEFINE_THIS_MODULE(route_exchange);
++static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 20);
++
++static struct sset _maintained_vrfs = SSET_INITIALIZER(&_maintained_vrfs);
++
++void
++route_exchange_run(struct route_exchange_ctx_in *r_ctx_in,
++                   struct route_exchange_ctx_out *r_ctx_out OVS_UNUSED)
++{
++    struct sset old_maintained_vrfs = SSET_INITIALIZER(&old_maintained_vrfs);
++    sset_swap(&_maintained_vrfs, &old_maintained_vrfs);
++
++    const struct advertise_datapath_entry *ad;
++    HMAP_FOR_EACH (ad, node, r_ctx_in->announce_routes) {
++        struct hmap received_routes
++                = HMAP_INITIALIZER(&received_routes);
++        char vrf_name[IFNAMSIZ + 1];
++        snprintf(vrf_name, sizeof vrf_name, "ovnvrf%"PRIi64,
++                 ad->key);
++
++        if (ad->maintain_vrf) {
++            int error = re_nl_create_vrf(vrf_name, ad->key);
++            if (error && error != EEXIST) {
++                VLOG_WARN_RL(&rl,
++                             "Unable to create VRF %s for datapath "
++                             "%"PRId64": %s.",
++                             vrf_name, ad->key,
++                             ovs_strerror(error));
++                continue;
++            }
++            sset_add(&_maintained_vrfs, vrf_name);
++        }
++
++        re_nl_sync_routes(ad->key, &ad->routes);
++    }
++
++    /* Remove VRFs previously maintained by us not found in the above loop. */
++    const char *vrf_name;
++    SSET_FOR_EACH_SAFE (vrf_name, &old_maintained_vrfs) {
++        if (!sset_find(&_maintained_vrfs, vrf_name)) {
++            re_nl_delete_vrf(vrf_name);
++        }
++        sset_delete(&old_maintained_vrfs, SSET_NODE_FROM_NAME(vrf_name));
++    }
++    sset_destroy(&old_maintained_vrfs);
++}
++
++void
++route_exchange_cleanup(void)
++{
++    const char *vrf_name;
++    SSET_FOR_EACH_SAFE (vrf_name, &_maintained_vrfs) {
++        re_nl_delete_vrf(vrf_name);
++    }
++}
++
++void
++route_exchange_destroy(void)
++{
++    const char *vrf_name;
++    SSET_FOR_EACH_SAFE (vrf_name, &_maintained_vrfs) {
++        sset_delete(&_maintained_vrfs, SSET_NODE_FROM_NAME(vrf_name));
++    }
++
++    sset_destroy(&_maintained_vrfs);
++}
+diff --git a/controller/route-exchange.h b/controller/route-exchange.h
+new file mode 100644
+index 000000000..2c2a9ab84
+--- /dev/null
++++ b/controller/route-exchange.h
+@@ -0,0 +1,33 @@
++/*
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at:
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef ROUTE_EXCHANGE_H
++#define ROUTE_EXCHANGE_H 1
++
++#include <stdbool.h>
++
++struct route_exchange_ctx_in {
++    /* Contains struct advertise_datapath_entry */
++    struct hmap *announce_routes;
++};
++
++struct route_exchange_ctx_out {
++};
++
++void route_exchange_run(struct route_exchange_ctx_in *,
++                        struct route_exchange_ctx_out *);
++void route_exchange_cleanup(void);
++void route_exchange_destroy(void);
++
++#endif /* ROUTE_EXCHANGE_H */
+-- 
+2.45.2
+

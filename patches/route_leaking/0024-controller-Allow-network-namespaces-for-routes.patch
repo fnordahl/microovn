@@ -1,0 +1,223 @@
+From e0a7f41419345209888102409e0d8f6d69f306fe Mon Sep 17 00:00:00 2001
+From: Frode Nordahl <fnordahl@ubuntu.com>
+Date: Mon, 4 Nov 2024 12:04:45 +0100
+Subject: [PATCH 24/31] controller: Allow network namespaces for routes.
+
+From: Felix Huettner <felix.huettner@stackit.cloud>
+
+instead of using VRFs to announce routes we can now also use network
+namespaces. This can be usefull if the network namespaces is used to
+also run the routing protocol agent (e.g. frr).
+The network namespace could then also have a vif port based on the
+routing-protocol-redirect feature.
+
+Signed-off-by: Felix Huettner <felix.huettner@stackit.cloud>
+---
+ controller/route-exchange-netlink.c | 43 +++++++++++++++++++----------
+ controller/route-exchange-netlink.h | 14 ++++++----
+ controller/route-exchange.c         |  4 +--
+ northd/northd.c                     |  3 ++
+ 4 files changed, 42 insertions(+), 22 deletions(-)
+
+diff --git a/controller/route-exchange-netlink.c b/controller/route-exchange-netlink.c
+index 1d6e1a58e..f2d72c3a7 100644
+--- a/controller/route-exchange-netlink.c
++++ b/controller/route-exchange-netlink.c
+@@ -38,7 +38,6 @@ static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 20);
+ #define TABLE_ID_VALID(table_id) (table_id != RT_TABLE_UNSPEC &&              \
+                                   table_id != RT_TABLE_COMPAT &&              \
+                                   table_id != RT_TABLE_DEFAULT &&             \
+-                                  table_id != RT_TABLE_MAIN &&                \
+                                   table_id != RT_TABLE_LOCAL &&               \
+                                   table_id != RT_TABLE_MAX)
+ 
+@@ -101,8 +100,8 @@ re_nl_delete_vrf(const char *ifname)
+ }
+ 
+ static int
+-modify_route(uint32_t type, uint32_t flags_arg, uint32_t table_id,
+-             const struct in6_addr *dst, unsigned int plen,
++modify_route(const char *netns, uint32_t type, uint32_t flags_arg,
++             uint32_t table_id, const struct in6_addr *dst, unsigned int plen,
+              unsigned int priority)
+ {
+     uint32_t flags = NLM_F_REQUEST | NLM_F_ACK;
+@@ -137,15 +136,16 @@ modify_route(uint32_t type, uint32_t flags_arg, uint32_t table_id,
+         nl_msg_put_in6_addr(&request, RTA_DST, dst);
+     }
+ 
+-    err = nl_transact(NULL, NETLINK_ROUTE, &request, NULL);
++    err = nl_transact(netns, NETLINK_ROUTE, &request, NULL);
+     ofpbuf_uninit(&request);
+ 
+     return err;
+ }
+ 
+ int
+-re_nl_add_route(uint32_t table_id, const struct in6_addr *dst,
+-                unsigned int plen, unsigned int priority)
++re_nl_add_route(const char *netns, uint32_t table_id,
++                const struct in6_addr *dst, unsigned int plen,
++                unsigned int priority)
+ {
+     uint32_t flags = NLM_F_CREATE | NLM_F_EXCL;
+     uint32_t type = RTM_NEWROUTE;
+@@ -157,12 +157,13 @@ re_nl_add_route(uint32_t table_id, const struct in6_addr *dst,
+         return EINVAL;
+     }
+ 
+-    return modify_route(type, flags, table_id, dst, plen, priority);
++    return modify_route(netns, type, flags, table_id, dst, plen, priority);
+ }
+ 
+ int
+-re_nl_delete_route(uint32_t table_id, const struct in6_addr *dst,
+-                   unsigned int plen, unsigned int priority)
++re_nl_delete_route(const char * netns, uint32_t table_id,
++                   const struct in6_addr *dst, unsigned int plen,
++                   unsigned int priority)
+ {
+     if (!TABLE_ID_VALID(table_id)) {
+         VLOG_WARN_RL(&rl,
+@@ -171,7 +172,7 @@ re_nl_delete_route(uint32_t table_id, const struct in6_addr *dst,
+         return EINVAL;
+     }
+ 
+-    return modify_route(RTM_DELROUTE, 0, table_id, dst, plen, priority);
++    return modify_route(netns, RTM_DELROUTE, 0, table_id, dst, plen, priority);
+ }
+ 
+ static uint32_t
+@@ -195,6 +196,7 @@ re_nl_received_routes_destroy(struct hmap *host_routes)
+ struct route_msg_handle_data {
+     const struct hmap *routes;
+     struct hmap *learned_routes;
++    const char *netns;
+ };
+ 
+ static void
+@@ -236,7 +238,8 @@ handle_route_msg_delete_routes(const struct route_table_msg *msg, void *data)
+         }
+     }
+ 
+-    err = re_nl_delete_route(rd->rta_table_id, &rd->rta_dst,
++    err = re_nl_delete_route(handle_data->netns,
++                             rd->rta_table_id, &rd->rta_dst,
+                              rd->plen, rd->rta_priority);
+     if (err) {
+         char addr_s[INET6_ADDRSTRLEN + 1];
+@@ -251,8 +254,16 @@ handle_route_msg_delete_routes(const struct route_table_msg *msg, void *data)
+ 
+ void
+ re_nl_sync_routes(uint32_t table_id,
+-                  const struct hmap *routes, struct hmap *learned_routes)
++                  const struct hmap *routes, struct hmap *learned_routes,
++                  bool use_netns)
+ {
++
++    char * netns = NULL;
++    if (use_netns) {
++        netns = xasprintf("ovnns%d", table_id);
++        table_id = RT_TABLE_MAIN;
++    }
++
+     struct advertise_route_entry *ar;
+     HMAP_FOR_EACH (ar, node, routes) {
+         ar->installed = false;
+@@ -264,8 +275,9 @@ re_nl_sync_routes(uint32_t table_id,
+     struct route_msg_handle_data data = {
+         .routes = routes,
+         .learned_routes = learned_routes,
++        .netns = netns,
+     };
+-    route_table_dump_one_table(NULL, table_id, handle_route_msg_delete_routes,
++    route_table_dump_one_table(netns, table_id, handle_route_msg_delete_routes,
+                                &data);
+ 
+     /* Add any remaining routes in the host_routes hmap to the system routing
+@@ -274,8 +286,8 @@ re_nl_sync_routes(uint32_t table_id,
+         if (ar->installed) {
+             continue;
+         }
+-        int err = re_nl_add_route(table_id, &ar->addr, ar->plen,
+-                                  ar->priority);
++        int err = re_nl_add_route(netns, table_id, &ar->addr,
++                                  ar->plen, ar->priority);
+         if (err) {
+             char addr_s[INET6_ADDRSTRLEN + 1];
+             VLOG_WARN_RL(&rl, "Add route table_id=%"PRIu32" dst=%s "
+@@ -287,4 +299,5 @@ re_nl_sync_routes(uint32_t table_id,
+                          ovs_strerror(err));
+         }
+     }
++    free(netns);
+ }
+diff --git a/controller/route-exchange-netlink.h b/controller/route-exchange-netlink.h
+index 4c0f37a98..11f989cf6 100644
+--- a/controller/route-exchange-netlink.h
++++ b/controller/route-exchange-netlink.h
+@@ -15,6 +15,7 @@
+ #ifndef ROUTE_EXCHANGE_NETLINK_H
+ #define ROUTE_EXCHANGE_NETLINK_H 1
+ 
++#include <stdbool.h>
+ #include <stdint.h>
+ #include "openvswitch/hmap.h"
+ #include <netinet/in.h>
+@@ -36,16 +37,19 @@ struct re_nl_received_route_node {
+ int re_nl_create_vrf(const char *ifname, uint32_t table_id);
+ int re_nl_delete_vrf(const char *ifname);
+ 
+-int re_nl_add_route(uint32_t table_id, const struct in6_addr *dst,
+-                    unsigned int plen, unsigned int priority);
+-int re_nl_delete_route(uint32_t table_id, const struct in6_addr *dst,
+-                       unsigned int plen, unsigned int priority);
++int re_nl_add_route(const char *netns, uint32_t table_id,
++                    const struct in6_addr *dst, unsigned int plen,
++                    unsigned int priority);
++int re_nl_delete_route(const char *netns, uint32_t table_id,
++                       const struct in6_addr *dst, unsigned int plen,
++                       unsigned int priority);
+ 
+ void re_nl_dump(uint32_t table_id);
+ 
+ void re_nl_received_routes_destroy(struct hmap *);
+ void re_nl_sync_routes(uint32_t table_id,
+                        const struct hmap *host_routes,
+-                       struct hmap *learned_routes);
++                       struct hmap *learned_routes,
++                       bool use_netns);
+ 
+ #endif /* route-exchange-netlink.h */
+diff --git a/controller/route-exchange.c b/controller/route-exchange.c
+index 41fea6398..a5a5afee5 100644
+--- a/controller/route-exchange.c
++++ b/controller/route-exchange.c
+@@ -195,8 +195,8 @@ route_exchange_run(struct route_exchange_ctx_in *r_ctx_in,
+             sset_add(&_maintained_vrfs, vrf_name);
+         }
+ 
+-        re_nl_sync_routes(ad->key, &ad->routes,
+-                          &received_routes);
++        re_nl_sync_routes(ad->key,
++                          &ad->routes, &received_routes, ad->use_netns);
+ 
+         sb_sync_learned_routes(ad->db, &received_routes,
+                                &ad->bound_ports,
+diff --git a/northd/northd.c b/northd/northd.c
+index 46e209fa4..69d86f1c7 100644
+--- a/northd/northd.c
++++ b/northd/northd.c
+@@ -4118,6 +4118,9 @@ sync_pb_for_lrp(struct ovn_port *op,
+         if (smap_get_bool(&op->nbrp->options, "maintain-vrf", false)) {
+             smap_add(&new, "maintain-vrf", "true");
+         }
++        if (smap_get_bool(&op->nbrp->options, "use-netns", false)) {
++            smap_add(&new, "use-netns", "true");
++        }
+         if (smap_get_bool(&op->od->nbr->options, "dynamic-routing", false)) {
+             smap_add(&new, "dynamic-routing", "true");
+         }
+-- 
+2.45.2
+

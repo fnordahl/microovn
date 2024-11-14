@@ -1,0 +1,865 @@
+From d76243d91f55dcf6fd645bf080f7f7e29b0d8e81 Mon Sep 17 00:00:00 2001
+From: Frode Nordahl <fnordahl@ubuntu.com>
+Date: Mon, 4 Nov 2024 12:04:21 +0100
+Subject: [PATCH 13/31] northd: Handle learned routes.
+
+From: Felix Huettner <felix.huettner@stackit.cloud>
+
+here we expand the previous routes-sync engine node to not only
+advertise routes to the southbound table, but also learn received routes
+from this table.
+
+These routes are then passed to the same logic that connected and static
+routes are using for flow generation.
+However we prioritize these routes lower than connected or static routes
+as information in cluster (for the same prefix length) should always be
+more correct then learned routes.
+This is also consistent with the behaviour of phyiscal routers.
+
+Signed-off-by: Felix Huettner <felix.huettner@stackit.cloud>
+---
+ northd/en-lflow.c        |   4 +-
+ northd/en-routes-sync.c  | 156 ++++++++++++++++++++++++++++++--
+ northd/en-routes-sync.h  |   6 +-
+ northd/inc-proc-northd.c |   2 +
+ northd/northd.c          | 186 ++++++++++++++++++++++++---------------
+ northd/northd.h          |  30 ++++++-
+ ovn-sb.ovsschema         |   5 +-
+ ovn-sb.xml               |  11 +++
+ tests/ovn-northd.at      |  42 ++++-----
+ 9 files changed, 335 insertions(+), 107 deletions(-)
+
+diff --git a/northd/en-lflow.c b/northd/en-lflow.c
+index fa1f0236d..8995f0300 100644
+--- a/northd/en-lflow.c
++++ b/northd/en-lflow.c
+@@ -46,6 +46,8 @@ lflow_get_input_data(struct engine_node *node,
+         engine_get_input_data("bfd_sync", node);
+     struct routes_data *routes_data =
+         engine_get_input_data("routes", node);
++    struct routes_sync_data *routes_sync_data =
++        engine_get_input_data("routes_sync", node);
+     struct route_policies_data *route_policies_data =
+         engine_get_input_data("route_policies", node);
+     struct port_group_data *pg_data =
+@@ -82,7 +84,7 @@ lflow_get_input_data(struct engine_node *node,
+     lflow_input->lb_datapaths_map = &northd_data->lb_datapaths_map;
+     lflow_input->svc_monitor_map = &northd_data->svc_monitor_map;
+     lflow_input->bfd_ports = &bfd_sync_data->bfd_ports;
+-    lflow_input->parsed_routes = &routes_data->parsed_routes;
++    lflow_input->parsed_routes = &routes_sync_data->parsed_routes;
+     lflow_input->route_tables = &routes_data->route_tables;
+     lflow_input->route_policies = &route_policies_data->route_policies;
+ 
+diff --git a/northd/en-routes-sync.c b/northd/en-routes-sync.c
+index 581f21b8e..c932cc34e 100644
+--- a/northd/en-routes-sync.c
++++ b/northd/en-routes-sync.c
+@@ -29,33 +29,86 @@ VLOG_DEFINE_THIS_MODULE(en_routes_sync);
+ static void
+ routes_table_sync(struct ovsdb_idl_txn *ovnsb_txn,
+                   const struct sbrec_route_table *sbrec_route_table,
+-                  const struct hmap *parsed_routes);
++                  const struct hmap *parsed_routes,
++                  const struct hmap *lr_ports,
++                  const struct ovn_datapaths *lr_datapaths,
++                  struct hmap *parsed_routes_out);
++
++static void
++routes_sync_init(struct routes_sync_data *data)
++{
++    hmap_init(&data->parsed_routes);
++}
++
++static void
++routes_sync_destroy(struct routes_sync_data *data)
++{
++    struct parsed_route *r;
++    HMAP_FOR_EACH_POP (r, key_node, &data->parsed_routes) {
++        parsed_route_free(r);
++    }
++    hmap_destroy(&data->parsed_routes);
++}
++
++bool
++routes_sync_northd_change_handler(struct engine_node *node,
++                                  void *data OVS_UNUSED)
++{
++    struct northd_data *northd_data = engine_get_input_data("northd", node);
++    if (!northd_has_tracked_data(&northd_data->trk_data)) {
++        return false;
++    }
++
++    /* This node uses the below data from the en_northd engine node.
++     * See (lr_stateful_get_input_data())
++     *   1. northd_data->lr_datapaths
++     *   2. northd_data->lr_ports
++     *      This data gets updated when a logical router or logical router port
++     *      is created or deleted.
++     *      Northd engine node presently falls back to full recompute when
++     *      this happens and so does this node.
++     *      Note: When we add I-P to the created/deleted logical routers or
++     *      logical router ports, we need to revisit this handler.
++     */
++    return true;
++}
+ 
+ void
+ *en_routes_sync_init(struct engine_node *node OVS_UNUSED,
+                      struct engine_arg *arg OVS_UNUSED)
+ {
+-    return NULL;
++    struct routes_sync_data *data = xzalloc(sizeof *data);
++    routes_sync_init(data);
++    return data;
+ }
+ 
+ void
+-en_routes_sync_cleanup(void *data_ OVS_UNUSED)
++en_routes_sync_cleanup(void *data)
+ {
++    routes_sync_destroy(data);
+ }
+ 
+ void
+-en_routes_sync_run(struct engine_node *node, void *data_ OVS_UNUSED)
++en_routes_sync_run(struct engine_node *node, void *data)
+ {
++    routes_sync_destroy(data);
++    routes_sync_init(data);
++
++    struct routes_sync_data *routes_sync_data = data;
+     struct routes_data *routes_data
+         = engine_get_input_data("routes", node);
+     const struct engine_context *eng_ctx = engine_get_context();
+     const struct sbrec_route_table *sbrec_route_table =
+         EN_OVSDB_GET(engine_get_input("SB_route", node));
++    struct northd_data *northd_data = engine_get_input_data("northd", node);
+ 
+     stopwatch_start(ROUTES_SYNC_RUN_STOPWATCH_NAME, time_msec());
+ 
+     routes_table_sync(eng_ctx->ovnsb_idl_txn, sbrec_route_table,
+-                      &routes_data->parsed_routes);
++                      &routes_data->parsed_routes,
++                      &northd_data->lr_ports,
++                      &northd_data->lr_datapaths,
++                      &routes_sync_data->parsed_routes);
+ 
+     stopwatch_stop(ROUTES_SYNC_RUN_STOPWATCH_NAME, time_msec());
+     engine_set_node_state(node, EN_UPDATED);
+@@ -136,10 +189,93 @@ get_nbrp_or_nbr_option(const struct ovn_port *op, const char *key)
+         smap_get_bool(&op->od->nbr->options, key, false));
+ }
+ 
++static void
++parse_route_from_sbrec_route(struct hmap *parsed_routes_out,
++                             const struct hmap *lr_ports,
++                             const struct hmap *lr_datapaths,
++                             const struct sbrec_route *route)
++{
++    const struct ovn_datapath *od = ovn_datapath_from_sbrec(
++        NULL, lr_datapaths, route->datapath);
++
++    /* Verify that the next hop is an IP address with an all-ones mask. */
++    struct in6_addr *nexthop = xmalloc(sizeof(*nexthop));
++    unsigned int plen;
++    if (!ip46_parse_cidr(route->nexthop, nexthop, &plen)) {
++        static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 1);
++        VLOG_WARN_RL(&rl, "bad 'nexthop' %s in learned route "
++                     UUID_FMT, route->nexthop,
++                     UUID_ARGS(&route->header_.uuid));
++        free(nexthop);
++        return;
++    }
++    if ((IN6_IS_ADDR_V4MAPPED(nexthop) && plen != 32) ||
++        (!IN6_IS_ADDR_V4MAPPED(nexthop) && plen != 128)) {
++        static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 1);
++        VLOG_WARN_RL(&rl, "bad next hop mask %s in learned route "
++                     UUID_FMT, route->nexthop,
++                     UUID_ARGS(&route->header_.uuid));
++        free(nexthop);
++        return;
++    }
++
++    /* Parse ip_prefix */
++    struct in6_addr prefix;
++    if (!ip46_parse_cidr(route->ip_prefix, &prefix, &plen)) {
++        static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 1);
++        VLOG_WARN_RL(&rl, "bad 'ip_prefix' %s in learned route "
++                     UUID_FMT, route->ip_prefix,
++                     UUID_ARGS(&route->header_.uuid));
++        free(nexthop);
++        return;
++    }
++
++    /* Verify that ip_prefix and nexthop have same address familiy. */
++    if (IN6_IS_ADDR_V4MAPPED(&prefix) != IN6_IS_ADDR_V4MAPPED(nexthop)) {
++        static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 1);
++        VLOG_WARN_RL(&rl, "Address family doesn't match between 'ip_prefix'"
++                     " %s and 'nexthop' %s in learned route "UUID_FMT,
++                     route->ip_prefix, route->nexthop,
++                     UUID_ARGS(&route->header_.uuid));
++        free(nexthop);
++        return;
++    }
++
++    /* Verify that ip_prefix and nexthop are on the same network. */
++    const char *lrp_addr_s = NULL;
++    struct ovn_port *out_port = NULL;
++    if (!find_route_outport(lr_ports, route->logical_port,
++                            route->ip_prefix, route->nexthop,
++                            IN6_IS_ADDR_V4MAPPED(&prefix),
++                            &out_port, &lrp_addr_s)) {
++        free(nexthop);
++        return;
++    }
++
++    parsed_route_add(
++        od,
++        nexthop,
++        prefix,
++        plen,
++        false,
++        lrp_addr_s,
++        out_port,
++        0,
++        false,
++        false,
++        ROUTE_SOURCE_LEARNED,
++        &route->header_,
++        parsed_routes_out
++        );
++}
++
+ static void
+ routes_table_sync(struct ovsdb_idl_txn *ovnsb_txn,
+                   const struct sbrec_route_table *sbrec_route_table,
+-                  const struct hmap *parsed_routes)
++                  const struct hmap *parsed_routes,
++                  const struct hmap *lr_ports,
++                  const struct ovn_datapaths *lr_datapaths,
++                  struct hmap *parsed_routes_out)
+ {
+     if (!ovnsb_txn) {
+         return;
+@@ -159,9 +295,17 @@ routes_table_sync(struct ovsdb_idl_txn *ovnsb_txn,
+                                     sb_route->type);
+         route_e->stale = true;
+         route_e->sb_route = sb_route;
++
++        if (!strcmp(route_e->type, "receive")) {
++            parse_route_from_sbrec_route(parsed_routes_out, lr_ports,
++                                         &lr_datapaths->datapaths,
++                                         sb_route);
++        }
+     }
+ 
+     HMAP_FOR_EACH (route, key_node, parsed_routes) {
++        hmap_insert(parsed_routes_out, &parsed_route_clone(route)->key_node,
++                    parsed_route_hash(route));
+         if (route->is_discard_route) {
+             continue;
+         }
+diff --git a/northd/en-routes-sync.h b/northd/en-routes-sync.h
+index ecd41b0b9..391f17452 100644
+--- a/northd/en-routes-sync.h
++++ b/northd/en-routes-sync.h
+@@ -16,10 +16,8 @@
+ 
+ #include "lib/inc-proc-eng.h"
+ 
+-/*struct routes_sync_data {
+-    struct sset routes;
+-};*/
+-
++bool routes_sync_northd_change_handler(struct engine_node *node,
++                                       void *data OVS_UNUSED);
+ void *en_routes_sync_init(struct engine_node *, struct engine_arg *);
+ void en_routes_sync_cleanup(void *data);
+ void en_routes_sync_run(struct engine_node *, void *data);
+diff --git a/northd/inc-proc-northd.c b/northd/inc-proc-northd.c
+index bc361ce72..741295709 100644
+--- a/northd/inc-proc-northd.c
++++ b/northd/inc-proc-northd.c
+@@ -269,6 +269,8 @@ void inc_proc_northd_init(struct ovsdb_idl_loop *nb,
+ 
+     engine_add_input(&en_routes_sync, &en_routes, NULL);
+     engine_add_input(&en_routes_sync, &en_sb_route, NULL);
++    engine_add_input(&en_routes_sync, &en_northd,
++                     routes_sync_northd_change_handler);
+ 
+     engine_add_input(&en_sync_meters, &en_nb_acl, NULL);
+     engine_add_input(&en_sync_meters, &en_nb_meter, NULL);
+diff --git a/northd/northd.c b/northd/northd.c
+index 4ad760025..b4412e70c 100644
+--- a/northd/northd.c
++++ b/northd/northd.c
+@@ -300,11 +300,14 @@ BUILD_ASSERT_DECL(ACL_OBS_STAGE_MAX < (1 << 2));
+ /*
+  * Route offsets implement logic to prioritize traffic for routes with
+  * same ip_prefix values:
+- *  -  connected route overrides static one;
+- *  -  static route overrides src-ip route. */
+-#define ROUTE_PRIO_OFFSET_MULTIPLIER 3
+-#define ROUTE_PRIO_OFFSET_STATIC 1
+-#define ROUTE_PRIO_OFFSET_CONNECTED 2
++ *  1. (highest priority) connected routes
++ *  2. static routes
++ *  3. routes learned from the outside via ovn-controller (e.g. bgp)
++ *  4. (lowest priority) src-ip routes */
++#define ROUTE_PRIO_OFFSET_MULTIPLIER 4
++#define ROUTE_PRIO_OFFSET_LEARNED 1
++#define ROUTE_PRIO_OFFSET_STATIC 2
++#define ROUTE_PRIO_OFFSET_CONNECTED 3
+ 
+ /* Returns the type of the datapath to which a flow with the given 'stage' may
+  * be added. */
+@@ -11046,7 +11049,7 @@ build_route_table_lflow(struct ovn_datapath *od, struct lflow_table *lflows,
+ }
+ 
+ static uint32_t
+-route_hash(struct parsed_route *route)
++route_hash(const struct parsed_route *route)
+ {
+     return hash_bytes(&route->prefix, sizeof route->prefix,
+                       (uint32_t)route->plen);
+@@ -11097,7 +11100,7 @@ parsed_route_lookup(struct hmap *routes, size_t hash,
+             continue;
+         }
+ 
+-        if (pr->route != new_pr->route) {
++        if (pr->source_hint != new_pr->source_hint) {
+             continue;
+         }
+ 
+@@ -11123,7 +11126,36 @@ parsed_route_lookup(struct hmap *routes, size_t hash,
+     return NULL;
+ }
+ 
+-static void
++struct parsed_route * parsed_route_clone(const struct parsed_route *pr) {
++    struct parsed_route *new_pr = xzalloc(sizeof *new_pr);
++    new_pr->prefix = pr->prefix;
++    new_pr->plen = pr->plen;
++    if (pr->nexthop) {
++        new_pr->nexthop = xmemdup(pr->nexthop, sizeof(*pr->nexthop));
++    }
++    new_pr->route_table_id = pr->route_table_id;
++    new_pr->is_src_route = pr->is_src_route;
++    new_pr->hash = route_hash(pr);
++    new_pr->ecmp_symmetric_reply = pr->ecmp_symmetric_reply;
++    new_pr->is_discard_route = pr->is_discard_route;
++    new_pr->od = pr->od;
++    new_pr->stale = pr->stale;
++    new_pr->source = pr->source;
++    new_pr->source_hint = pr->source_hint;
++    if (pr->lrp_addr_s) {
++        new_pr->lrp_addr_s = xstrdup(pr->lrp_addr_s);
++    }
++    if (pr->out_port) {
++        new_pr->out_port = pr->out_port;
++    }
++    return new_pr;
++}
++
++size_t parsed_route_hash(const struct parsed_route *pr) {
++    return uuid_hash(&pr->od->key);
++}
++
++void
+ parsed_route_free(struct parsed_route *pr) {
+     if (pr->nexthop) {
+         free(pr->nexthop);
+@@ -11135,7 +11167,7 @@ parsed_route_free(struct parsed_route *pr) {
+     free(pr);
+ }
+ 
+-static void
++void
+ parsed_route_add(const struct ovn_datapath *od,
+                  struct in6_addr *nexthop,
+                  const struct in6_addr prefix,
+@@ -11143,11 +11175,11 @@ parsed_route_add(const struct ovn_datapath *od,
+                  bool is_discard_route,
+                  const char *lrp_addr_s,
+                  const struct ovn_port *out_port,
+-                 const struct nbrec_logical_router_static_route *route,
+                  uint32_t route_table_id,
+                  bool is_src_route,
+                  bool ecmp_symmetric_reply,
+                  enum route_source source,
++                 const struct ovsdb_idl_row *source_hint,
+                  struct hmap *routes)
+ {
+ 
+@@ -11166,9 +11198,9 @@ parsed_route_add(const struct ovn_datapath *od,
+     }
+     new_pr->out_port = out_port;
+     new_pr->source = source;
+-    new_pr->route = route;
++    new_pr->source_hint = source_hint;
+ 
+-    size_t hash = uuid_hash(&od->key);
++    size_t hash = parsed_route_hash(new_pr);
+     struct parsed_route *pr = parsed_route_lookup(routes, hash, new_pr);
+     if (!pr) {
+         hmap_insert(routes, &new_pr->key_node, hash);
+@@ -11294,8 +11326,8 @@ parsed_routes_add_static(const struct ovn_datapath *od,
+     }
+ 
+     parsed_route_add(od, nexthop, prefix, plen, is_discard_route, lrp_addr_s,
+-                      out_port, route, route_table_id, is_src_route,
+-                      ecmp_symmetric_reply, source,
++                      out_port, route_table_id, is_src_route,
++                      ecmp_symmetric_reply, source, &route->header_,
+                       routes);
+ }
+ 
+@@ -11311,9 +11343,9 @@ parsed_routes_add_connected(const struct ovn_datapath *od,
+ 
+         parsed_route_add(od, NULL, prefix, addr->plen,
+                           false, addr->addr_s, op,
+-                          NULL, 0, false,
++                          0, false,
+                           false, ROUTE_SOURCE_CONNECTED,
+-                          routes);
++                          &op->nbrp->header_, routes);
+     }
+ 
+     for (int i = 0; i < op->lrp_networks.n_ipv6_addrs; i++) {
+@@ -11323,9 +11355,9 @@ parsed_routes_add_connected(const struct ovn_datapath *od,
+ 
+         parsed_route_add(od, NULL, prefix, addr->plen,
+                           false, addr->addr_s, op,
+-                          NULL, 0, false,
++                          0, false,
+                           false, ROUTE_SOURCE_CONNECTED,
+-                          routes);
++                          &op->nbrp->header_, routes);
+     }
+ }
+ 
+@@ -11543,6 +11575,41 @@ build_route_match(const struct ovn_port *op_inport, uint32_t rtb_id,
+                   network_s, plen);
+ }
+ 
++bool
++find_route_outport(const struct hmap *lr_ports, const char *output_port,
++                   const char *ip_prefix, const char *nexthop, bool is_ipv4,
++                   struct ovn_port **out_port, const char **lrp_addr_s)
++{
++    *out_port = ovn_port_find(lr_ports, output_port);
++    if (!*out_port) {
++        static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 1);
++        VLOG_WARN_RL(&rl, "Bad out port %s for static route %s",
++                     output_port, ip_prefix);
++        return false;
++    }
++    if (nexthop[0]) {
++        *lrp_addr_s = find_lrp_member_ip(*out_port, nexthop);
++    }
++    if (!*lrp_addr_s) {
++        /* There are no IP networks configured on the router's port via
++         * which 'route->nexthop' is theoretically reachable.  But since
++         * 'out_port' has been specified, we honor it by trying to reach
++         * 'route->nexthop' via the first IP address of 'out_port'.
++         * (There are cases, e.g in GCE, where each VM gets a /32 IP
++         * address and the default gateway is still reachable from it.) */
++        if (is_ipv4) {
++            if ((*out_port)->lrp_networks.n_ipv4_addrs) {
++                *lrp_addr_s = (*out_port)->lrp_networks.ipv4_addrs[0].addr_s;
++            }
++        } else {
++            if ((*out_port)->lrp_networks.n_ipv6_addrs) {
++                *lrp_addr_s = (*out_port)->lrp_networks.ipv6_addrs[0].addr_s;
++            }
++        }
++    }
++    return true;
++}
++
+ /* Output: p_lrp_addr_s and p_out_port. */
+ static bool
+ find_static_route_outport(const struct ovn_datapath *od,
+@@ -11553,33 +11620,10 @@ find_static_route_outport(const struct ovn_datapath *od,
+     const char *lrp_addr_s = NULL;
+     struct ovn_port *out_port = NULL;
+     if (route->output_port) {
+-        out_port = ovn_port_find(lr_ports, route->output_port);
+-        if (!out_port) {
+-            static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 1);
+-            VLOG_WARN_RL(&rl, "Bad out port %s for static route %s",
+-                         route->output_port, route->ip_prefix);
++        if (!find_route_outport(lr_ports, route->output_port, route->ip_prefix,
++              route->nexthop, is_ipv4, &out_port, &lrp_addr_s)) {
+             return false;
+         }
+-        if (route->nexthop[0]) {
+-            lrp_addr_s = find_lrp_member_ip(out_port, route->nexthop);
+-        }
+-        if (!lrp_addr_s) {
+-            /* There are no IP networks configured on the router's port via
+-             * which 'route->nexthop' is theoretically reachable.  But since
+-             * 'out_port' has been specified, we honor it by trying to reach
+-             * 'route->nexthop' via the first IP address of 'out_port'.
+-             * (There are cases, e.g in GCE, where each VM gets a /32 IP
+-             * address and the default gateway is still reachable from it.) */
+-            if (is_ipv4) {
+-                if (out_port->lrp_networks.n_ipv4_addrs) {
+-                    lrp_addr_s = out_port->lrp_networks.ipv4_addrs[0].addr_s;
+-                }
+-            } else {
+-                if (out_port->lrp_networks.n_ipv6_addrs) {
+-                    lrp_addr_s = out_port->lrp_networks.ipv6_addrs[0].addr_s;
+-                }
+-            }
+-        }
+     } else {
+         /* output_port is not specified, find the
+          * router port matching the next hop. */
+@@ -11618,7 +11662,6 @@ add_ecmp_symmetric_reply_flows(struct lflow_table *lflows,
+                                struct ds *route_match,
+                                struct lflow_ref *lflow_ref)
+ {
+-    const struct nbrec_logical_router_static_route *st_route = route->route;
+     struct ds match = DS_EMPTY_INITIALIZER;
+     struct ds actions = DS_EMPTY_INITIALIZER;
+     struct ds ecmp_reply = DS_EMPTY_INITIALIZER;
+@@ -11635,12 +11678,12 @@ add_ecmp_symmetric_reply_flows(struct lflow_table *lflows,
+     free(cidr);
+     ovn_lflow_add_with_hint(lflows, od, S_ROUTER_IN_DEFRAG, 100,
+                              ds_cstr(&match), "ct_next;",
+-                             &st_route->header_, lflow_ref);
++                             route->source_hint, lflow_ref);
+ 
+     /* And packets that go out over an ECMP route need conntrack */
+     ovn_lflow_add_with_hint(lflows, od, S_ROUTER_IN_DEFRAG, 100,
+                              ds_cstr(route_match), "ct_next;",
+-                             &st_route->header_, lflow_ref);
++                             route->source_hint, lflow_ref);
+ 
+     /* Save src eth and inport in ct_label for packets that arrive over
+      * an ECMP route.
+@@ -11656,7 +11699,7 @@ add_ecmp_symmetric_reply_flows(struct lflow_table *lflows,
+             out_port->sb->tunnel_key);
+     ovn_lflow_add_with_hint(lflows, od, S_ROUTER_IN_ECMP_STATEFUL, 100,
+                             ds_cstr(&match), ds_cstr(&actions),
+-                            &st_route->header_,
++                            route->source_hint,
+                             lflow_ref);
+ 
+     /* Bypass ECMP selection if we already have ct_label information
+@@ -11676,13 +11719,13 @@ add_ecmp_symmetric_reply_flows(struct lflow_table *lflows,
+                   port_ip, out_port->json_key);
+     ovn_lflow_add_with_hint(lflows, od, S_ROUTER_IN_IP_ROUTING, 10300,
+                            ds_cstr(&match), ds_cstr(&actions),
+-                           &st_route->header_,
++                           route->source_hint,
+                            lflow_ref);
+ 
+     /* Egress reply traffic for symmetric ECMP routes skips router policies. */
+     ovn_lflow_add_with_hint(lflows, od, S_ROUTER_IN_POLICY, 65535,
+                             ds_cstr(&ecmp_reply), "next;",
+-                            &st_route->header_,
++                            route->source_hint,
+                             lflow_ref);
+ 
+     /* Use REG_ECMP_ETH_FULL to pass the eth field from ct_label to eth.dst to
+@@ -11699,7 +11742,7 @@ add_ecmp_symmetric_reply_flows(struct lflow_table *lflows,
+                          " pop(" REG_ECMP_ETH_FULL "); next;";
+     ovn_lflow_add_with_hint(lflows, od, S_ROUTER_IN_ARP_RESOLVE,
+                             200, ds_cstr(&ecmp_reply),
+-                            action, &st_route->header_,
++                            action, route->source_hint,
+                             lflow_ref);
+ 
+     ds_destroy(&match);
+@@ -11715,6 +11758,8 @@ route_source_to_offset(enum route_source source)
+             return ROUTE_PRIO_OFFSET_CONNECTED;
+         case ROUTE_SOURCE_STATIC:
+             return ROUTE_PRIO_OFFSET_STATIC;
++        case ROUTE_SOURCE_LEARNED:
++            return ROUTE_PRIO_OFFSET_LEARNED;
+         default:
+             OVS_NOT_REACHED();
+     }
+@@ -11767,17 +11812,16 @@ build_ecmp_route_flow(struct lflow_table *lflows, struct ovn_datapath *od,
+     struct ds match = DS_EMPTY_INITIALIZER;
+     struct sset visited_ports = SSET_INITIALIZER(&visited_ports);
+     LIST_FOR_EACH (er, list_node, &eg->route_list) {
+-        const struct parsed_route *route_ = er->route;
+-        const struct nbrec_logical_router_static_route *route = route_->route;
++        const struct parsed_route *route = er->route;
+         /* Symmetric ECMP reply is only usable on gateway routers.
+          * It is NOT usable on distributed routers with a gateway port.
+          */
+         if (smap_get(&od->nbr->options, "chassis") &&
+-            route_->ecmp_symmetric_reply && sset_add(&visited_ports,
+-                                                     route_->out_port->key)) {
+-            add_ecmp_symmetric_reply_flows(lflows, od, route_->lrp_addr_s,
+-                                           route_->out_port,
+-                                           route_, &route_match,
++            route->ecmp_symmetric_reply && sset_add(&visited_ports,
++                                                     route->out_port->key)) {
++            add_ecmp_symmetric_reply_flows(lflows, od, route->lrp_addr_s,
++                                           route->out_port,
++                                           route, &route_match,
+                                            lflow_ref);
+         }
+         ds_clear(&match);
+@@ -11787,19 +11831,19 @@ build_ecmp_route_flow(struct lflow_table *lflows, struct ovn_datapath *od,
+         ds_clear(&actions);
+         ds_put_format(&actions, "%s = ",
+                       is_ipv4 ? REG_NEXT_HOP_IPV4 : REG_NEXT_HOP_IPV6);
+-        ipv6_format_mapped(route_->nexthop, &actions);
++        ipv6_format_mapped(route->nexthop, &actions);
+         ds_put_format(&actions, "; "
+                       "%s = %s; "
+                       "eth.src = %s; "
+                       "outport = %s; "
+                       "next;",
+                       is_ipv4 ? REG_SRC_IPV4 : REG_SRC_IPV6,
+-                      route_->lrp_addr_s,
+-                      route_->out_port->lrp_networks.ea_s,
+-                      route_->out_port->json_key);
++                      route->lrp_addr_s,
++                      route->out_port->lrp_networks.ea_s,
++                      route->out_port->json_key);
+         ovn_lflow_add_with_hint(lflows, od, S_ROUTER_IN_IP_ROUTING_ECMP, 100,
+                                 ds_cstr(&match), ds_cstr(&actions),
+-                                &route->header_, lflow_ref);
++                                route->source_hint, lflow_ref);
+     }
+     sset_destroy(&visited_ports);
+     ds_destroy(&match);
+@@ -11878,19 +11922,17 @@ add_route(struct lflow_table *lflows, struct ovn_datapath *od,
+ 
+ static void
+ build_route_flow(struct lflow_table *lflows, struct ovn_datapath *od,
+-                        const struct parsed_route *route_,
++                        const struct parsed_route *route,
+                         const struct sset *bfd_ports,
+                         struct lflow_ref *lflow_ref)
+ {
+-    const struct nbrec_logical_router_static_route *route = route_->route;
+-
+-    char *prefix_s = build_route_prefix_s(&route_->prefix, route_->plen);
+-    add_route(lflows, route_->is_discard_route ? od : route_->out_port->od,
+-              route_->out_port, route_->lrp_addr_s, prefix_s,
+-              route_->plen, route_->nexthop, route_->is_src_route,
+-              route_->route_table_id, bfd_ports,
+-              route ? &route->header_ : &route_->out_port->nbrp->header_,
+-              route_->is_discard_route, route_->source, lflow_ref);
++    char *prefix_s = build_route_prefix_s(&route->prefix, route->plen);
++    add_route(lflows, route->is_discard_route ? od : route->out_port->od,
++              route->out_port, route->lrp_addr_s, prefix_s,
++              route->plen, route->nexthop, route->is_src_route,
++              route->route_table_id, bfd_ports,
++              route->source_hint,
++              route->is_discard_route, route->source, lflow_ref);
+ 
+     free(prefix_s);
+ }
+diff --git a/northd/northd.h b/northd/northd.h
+index 77faab65d..126d58626 100644
+--- a/northd/northd.h
++++ b/northd/northd.h
+@@ -186,6 +186,10 @@ struct routes_data {
+     struct hmap bfd_active_connections;
+ };
+ 
++struct routes_sync_data {
++    struct hmap parsed_routes;
++};
++
+ struct route_policies_data {
+     struct hmap route_policies;
+     struct hmap bfd_active_connections;
+@@ -701,6 +705,8 @@ enum route_source {
+     ROUTE_SOURCE_CONNECTED,
+     /* the route is derived from a northbound static route entry */
+     ROUTE_SOURCE_STATIC,
++    /* the route is learned by an ovn-controller */
++    ROUTE_SOURCE_LEARNED,
+ };
+ 
+ struct parsed_route {
+@@ -711,16 +717,38 @@ struct parsed_route {
+     bool is_src_route;
+     uint32_t route_table_id;
+     uint32_t hash;
+-    const struct nbrec_logical_router_static_route *route;
+     bool ecmp_symmetric_reply;
+     bool is_discard_route;
+     const struct ovn_datapath *od;
+     bool stale;
+     enum route_source source;
++    const struct ovsdb_idl_row *source_hint;
+     char *lrp_addr_s;
+     const struct ovn_port *out_port;
+ };
+ 
++struct parsed_route * parsed_route_clone(const struct parsed_route *pr);
++size_t parsed_route_hash(const struct parsed_route *pr);
++void parsed_route_free(struct parsed_route *pr);
++void parsed_route_add(const struct ovn_datapath *od,
++                      struct in6_addr *nexthop,
++                      const struct in6_addr prefix,
++                      unsigned int plen,
++                      bool is_discard_route,
++                      const char *lrp_addr_s,
++                      const struct ovn_port *out_port,
++                      uint32_t route_table_id,
++                      bool is_src_route,
++                      bool ecmp_symmetric_reply,
++                      enum route_source source,
++                      const struct ovsdb_idl_row *source_hint,
++                      struct hmap *routes);
++
++bool
++find_route_outport(const struct hmap *lr_ports, const char *output_port,
++                   const char *ip_prefix, const char *nexthop, bool is_ipv4,
++                   struct ovn_port **out_port, const char **lrp_addr_s);
++
+ void ovnnb_db_run(struct northd_input *input_data,
+                   struct northd_data *data,
+                   struct ovsdb_idl_txn *ovnnb_txn,
+diff --git a/ovn-sb.ovsschema b/ovn-sb.ovsschema
+index 22e43dc8a..74540782e 100644
+--- a/ovn-sb.ovsschema
++++ b/ovn-sb.ovsschema
+@@ -1,7 +1,7 @@
+ {
+     "name": "OVN_Southbound",
+     "version": "20.38.0",
+-    "cksum": "956398967 32154",
++    "cksum": "1944407838 32212",
+     "tables": {
+         "SB_Global": {
+             "columns": {
+@@ -625,11 +625,12 @@
+                                       "refTable": "Datapath_Binding"}}},
+                 "logical_port": {"type": "string"},
+                 "ip_prefix": {"type": "string"},
++                "nexthop": {"type": "string"},
+                 "type": {"type": {"key": {"type": "string",
+                                           "enum": ["set", ["advertise",
+                                                            "receive"]]},
+                                     "min": 1, "max": 1}}},
+-            "indexes": [["datapath", "logical_port", "ip_prefix"]],
++            "indexes": [["datapath", "logical_port", "ip_prefix", "nexthop"]],
+             "isRoot": true}
+     }
+ }
+diff --git a/ovn-sb.xml b/ovn-sb.xml
+index a65bd2cbb..493b7e839 100644
+--- a/ovn-sb.xml
++++ b/ovn-sb.xml
+@@ -5213,6 +5213,17 @@ tcp.flags = RST;
+       </p>
+     </column>
+ 
++    <column name="nexthop">
++      <p>
++        If the type is <code>advertise</code> then this is empty.
++      </p>
++
++      <p>
++        If the type is <code>receive</code> then this is the nexthop ip we
++        from the outside.
++      </p>
++    </column>
++
+     <column name="type">
+       <p>
+         If the route is to be exported from OVN to the outside network or if
+diff --git a/tests/ovn-northd.at b/tests/ovn-northd.at
+index 4588a65c6..9583df998 100644
+--- a/tests/ovn-northd.at
++++ b/tests/ovn-northd.at
+@@ -6810,9 +6810,9 @@ AT_CHECK([grep -w "lr_in_ip_routing" lr0flows | ovn_strip_lflows], [0], [dnl
+   table=??(lr_in_ip_routing   ), priority=0    , match=(1), action=(drop;)
+   table=??(lr_in_ip_routing   ), priority=10300, match=(ct_mark.ecmp_reply_port == 1 && reg7 == 0 && ip4.dst == 1.0.0.1/32), action=(ip.ttl--; flags.loopback = 1; eth.src = 00:00:20:20:12:13; reg1 = 192.168.0.1; outport = "lr0-public"; next;)
+   table=??(lr_in_ip_routing   ), priority=10550, match=(nd_rs || nd_ra), action=(drop;)
+-  table=??(lr_in_ip_routing   ), priority=194  , match=(inport == "lr0-public" && ip6.dst == fe80::/64), action=(ip.ttl--; reg8[[0..15]] = 0; xxreg0 = ip6.dst; xxreg1 = fe80::200:20ff:fe20:1213; eth.src = 00:00:20:20:12:13; outport = "lr0-public"; flags.loopback = 1; next;)
+-  table=??(lr_in_ip_routing   ), priority=74   , match=(ip4.dst == 192.168.0.0/24), action=(ip.ttl--; reg8[[0..15]] = 0; reg0 = ip4.dst; reg1 = 192.168.0.1; eth.src = 00:00:20:20:12:13; outport = "lr0-public"; flags.loopback = 1; next;)
+-  table=??(lr_in_ip_routing   ), priority=97   , match=(reg7 == 0 && ip4.dst == 1.0.0.1/32), action=(ip.ttl--; flags.loopback = 1; reg8[[0..15]] = 1; reg8[[16..31]] = 1; next;)
++  table=??(lr_in_ip_routing   ), priority=130  , match=(reg7 == 0 && ip4.dst == 1.0.0.1/32), action=(ip.ttl--; flags.loopback = 1; reg8[[0..15]] = 1; reg8[[16..31]] = 1; next;)
++  table=??(lr_in_ip_routing   ), priority=259  , match=(inport == "lr0-public" && ip6.dst == fe80::/64), action=(ip.ttl--; reg8[[0..15]] = 0; xxreg0 = ip6.dst; xxreg1 = fe80::200:20ff:fe20:1213; eth.src = 00:00:20:20:12:13; outport = "lr0-public"; flags.loopback = 1; next;)
++  table=??(lr_in_ip_routing   ), priority=99   , match=(ip4.dst == 192.168.0.0/24), action=(ip.ttl--; reg8[[0..15]] = 0; reg0 = ip4.dst; reg1 = 192.168.0.1; eth.src = 00:00:20:20:12:13; outport = "lr0-public"; flags.loopback = 1; next;)
+ ])
+ 
+ AT_CHECK([grep -e "lr_in_ip_routing_ecmp" lr0flows | ovn_strip_lflows], [0], [dnl
+@@ -6828,9 +6828,9 @@ AT_CHECK([grep -w "lr_in_ip_routing" lr0flows | ovn_strip_lflows], [0], [dnl
+   table=??(lr_in_ip_routing   ), priority=0    , match=(1), action=(drop;)
+   table=??(lr_in_ip_routing   ), priority=10300, match=(ct_mark.ecmp_reply_port == 1 && reg7 == 0 && ip4.dst == 1.0.0.1/32), action=(ip.ttl--; flags.loopback = 1; eth.src = 00:00:20:20:12:13; reg1 = 192.168.0.1; outport = "lr0-public"; next;)
+   table=??(lr_in_ip_routing   ), priority=10550, match=(nd_rs || nd_ra), action=(drop;)
+-  table=??(lr_in_ip_routing   ), priority=194  , match=(inport == "lr0-public" && ip6.dst == fe80::/64), action=(ip.ttl--; reg8[[0..15]] = 0; xxreg0 = ip6.dst; xxreg1 = fe80::200:20ff:fe20:1213; eth.src = 00:00:20:20:12:13; outport = "lr0-public"; flags.loopback = 1; next;)
+-  table=??(lr_in_ip_routing   ), priority=74   , match=(ip4.dst == 192.168.0.0/24), action=(ip.ttl--; reg8[[0..15]] = 0; reg0 = ip4.dst; reg1 = 192.168.0.1; eth.src = 00:00:20:20:12:13; outport = "lr0-public"; flags.loopback = 1; next;)
+-  table=??(lr_in_ip_routing   ), priority=97   , match=(reg7 == 0 && ip4.dst == 1.0.0.1/32), action=(ip.ttl--; flags.loopback = 1; reg8[[0..15]] = 1; reg8[[16..31]] = select(1, 2);)
++  table=??(lr_in_ip_routing   ), priority=130  , match=(reg7 == 0 && ip4.dst == 1.0.0.1/32), action=(ip.ttl--; flags.loopback = 1; reg8[[0..15]] = 1; reg8[[16..31]] = select(1, 2);)
++  table=??(lr_in_ip_routing   ), priority=259  , match=(inport == "lr0-public" && ip6.dst == fe80::/64), action=(ip.ttl--; reg8[[0..15]] = 0; xxreg0 = ip6.dst; xxreg1 = fe80::200:20ff:fe20:1213; eth.src = 00:00:20:20:12:13; outport = "lr0-public"; flags.loopback = 1; next;)
++  table=??(lr_in_ip_routing   ), priority=99   , match=(ip4.dst == 192.168.0.0/24), action=(ip.ttl--; reg8[[0..15]] = 0; reg0 = ip4.dst; reg1 = 192.168.0.1; eth.src = 00:00:20:20:12:13; outport = "lr0-public"; flags.loopback = 1; next;)
+ ])
+ AT_CHECK([grep -e "lr_in_ip_routing_ecmp" lr0flows | sed 's/192\.168\.0\..0/192.168.0.??/' | ovn_strip_lflows], [0], [dnl
+   table=??(lr_in_ip_routing_ecmp), priority=0    , match=(1), action=(drop;)
+@@ -6857,9 +6857,9 @@ AT_CHECK([grep -w "lr_in_ip_routing" lr0flows | ovn_strip_lflows], [0], [dnl
+   table=??(lr_in_ip_routing   ), priority=0    , match=(1), action=(drop;)
+   table=??(lr_in_ip_routing   ), priority=10300, match=(ct_mark.ecmp_reply_port == 1 && reg7 == 0 && ip4.dst == 1.0.0.1/32), action=(ip.ttl--; flags.loopback = 1; eth.src = 00:00:20:20:12:13; reg1 = 192.168.0.1; outport = "lr0-public"; next;)
+   table=??(lr_in_ip_routing   ), priority=10550, match=(nd_rs || nd_ra), action=(drop;)
+-  table=??(lr_in_ip_routing   ), priority=194  , match=(inport == "lr0-public" && ip6.dst == fe80::/64), action=(ip.ttl--; reg8[[0..15]] = 0; xxreg0 = ip6.dst; xxreg1 = fe80::200:20ff:fe20:1213; eth.src = 00:00:20:20:12:13; outport = "lr0-public"; flags.loopback = 1; next;)
+-  table=??(lr_in_ip_routing   ), priority=74   , match=(ip4.dst == 192.168.0.0/24), action=(ip.ttl--; reg8[[0..15]] = 0; reg0 = ip4.dst; reg1 = 192.168.0.1; eth.src = 00:00:20:20:12:13; outport = "lr0-public"; flags.loopback = 1; next;)
+-  table=??(lr_in_ip_routing   ), priority=97   , match=(reg7 == 0 && ip4.dst == 1.0.0.1/32), action=(ip.ttl--; flags.loopback = 1; reg8[[0..15]] = 1; reg8[[16..31]] = select(1, 2);)
++  table=??(lr_in_ip_routing   ), priority=130  , match=(reg7 == 0 && ip4.dst == 1.0.0.1/32), action=(ip.ttl--; flags.loopback = 1; reg8[[0..15]] = 1; reg8[[16..31]] = select(1, 2);)
++  table=??(lr_in_ip_routing   ), priority=259  , match=(inport == "lr0-public" && ip6.dst == fe80::/64), action=(ip.ttl--; reg8[[0..15]] = 0; xxreg0 = ip6.dst; xxreg1 = fe80::200:20ff:fe20:1213; eth.src = 00:00:20:20:12:13; outport = "lr0-public"; flags.loopback = 1; next;)
++  table=??(lr_in_ip_routing   ), priority=99   , match=(ip4.dst == 192.168.0.0/24), action=(ip.ttl--; reg8[[0..15]] = 0; reg0 = ip4.dst; reg1 = 192.168.0.1; eth.src = 00:00:20:20:12:13; outport = "lr0-public"; flags.loopback = 1; next;)
+ ])
+ AT_CHECK([grep -e "lr_in_ip_routing_ecmp" lr0flows | sed 's/192\.168\.0\..0/192.168.0.??/' | ovn_strip_lflows], [0], [dnl
+   table=??(lr_in_ip_routing_ecmp), priority=0    , match=(1), action=(drop;)
+@@ -6875,14 +6875,14 @@ check ovn-nbctl --wait=sb lr-route-add lr0 1.0.0.0/24 192.168.0.10
+ ovn-sbctl dump-flows lr0 > lr0flows
+ 
+ AT_CHECK([grep -e "lr_in_ip_routing.*192.168.0.10" lr0flows | ovn_strip_lflows], [0], [dnl
+-  table=??(lr_in_ip_routing   ), priority=73   , match=(reg7 == 0 && ip4.dst == 1.0.0.0/24), action=(ip.ttl--; reg8[[0..15]] = 0; reg0 = 192.168.0.10; reg1 = 192.168.0.1; eth.src = 00:00:20:20:12:13; outport = "lr0-public"; flags.loopback = 1; next;)
++  table=??(lr_in_ip_routing   ), priority=98   , match=(reg7 == 0 && ip4.dst == 1.0.0.0/24), action=(ip.ttl--; reg8[[0..15]] = 0; reg0 = 192.168.0.10; reg1 = 192.168.0.1; eth.src = 00:00:20:20:12:13; outport = "lr0-public"; flags.loopback = 1; next;)
+ ])
+ 
+ check ovn-nbctl --wait=sb lr-route-add lr0 2.0.0.0/24 lr0-public
+ 
+ ovn-sbctl dump-flows lr0 > lr0flows
+ AT_CHECK([grep -e "lr_in_ip_routing.*2.0.0.0" lr0flows | ovn_strip_lflows], [0], [dnl
+-  table=??(lr_in_ip_routing   ), priority=73   , match=(reg7 == 0 && ip4.dst == 2.0.0.0/24), action=(ip.ttl--; reg8[[0..15]] = 0; reg0 = ip4.dst; reg1 = 192.168.0.1; eth.src = 00:00:20:20:12:13; outport = "lr0-public"; flags.loopback = 1; next;)
++  table=??(lr_in_ip_routing   ), priority=98   , match=(reg7 == 0 && ip4.dst == 2.0.0.0/24), action=(ip.ttl--; reg8[[0..15]] = 0; reg0 = ip4.dst; reg1 = 192.168.0.1; eth.src = 00:00:20:20:12:13; outport = "lr0-public"; flags.loopback = 1; next;)
+ ])
+ 
+ AT_CLEANUP
+@@ -7306,16 +7306,16 @@ AT_CHECK([grep "lr_in_ip_routing_pre" lr0flows | ovn_strip_lflows], [0], [dnl
+ grep -e "(lr_in_ip_routing   ).*outport" lr0flows
+ 
+ AT_CHECK([grep -e "(lr_in_ip_routing   ).*outport" lr0flows | ovn_strip_lflows], [0], [dnl
+-  table=??(lr_in_ip_routing   ), priority=1    , match=(reg7 == 0 && ip4.dst == 0.0.0.0/0), action=(ip.ttl--; reg8[[0..15]] = 0; reg0 = 192.168.0.10; reg1 = 192.168.0.1; eth.src = 00:00:00:00:00:01; outport = "lrp0"; flags.loopback = 1; next;)
+-  table=??(lr_in_ip_routing   ), priority=1    , match=(reg7 == 2 && ip4.dst == 0.0.0.0/0), action=(ip.ttl--; reg8[[0..15]] = 0; reg0 = 192.168.0.10; reg1 = 192.168.0.1; eth.src = 00:00:00:00:00:01; outport = "lrp0"; flags.loopback = 1; next;)
+-  table=??(lr_in_ip_routing   ), priority=194  , match=(inport == "lrp0" && ip6.dst == fe80::/64), action=(ip.ttl--; reg8[[0..15]] = 0; xxreg0 = ip6.dst; xxreg1 = fe80::200:ff:fe00:1; eth.src = 00:00:00:00:00:01; outport = "lrp0"; flags.loopback = 1; next;)
+-  table=??(lr_in_ip_routing   ), priority=194  , match=(inport == "lrp1" && ip6.dst == fe80::/64), action=(ip.ttl--; reg8[[0..15]] = 0; xxreg0 = ip6.dst; xxreg1 = fe80::200:ff:fe00:101; eth.src = 00:00:00:00:01:01; outport = "lrp1"; flags.loopback = 1; next;)
+-  table=??(lr_in_ip_routing   ), priority=194  , match=(inport == "lrp2" && ip6.dst == fe80::/64), action=(ip.ttl--; reg8[[0..15]] = 0; xxreg0 = ip6.dst; xxreg1 = fe80::200:ff:fe00:201; eth.src = 00:00:00:00:02:01; outport = "lrp2"; flags.loopback = 1; next;)
+-  table=??(lr_in_ip_routing   ), priority=73   , match=(reg7 == 1 && ip4.dst == 192.168.0.0/24), action=(ip.ttl--; reg8[[0..15]] = 0; reg0 = 192.168.1.10; reg1 = 192.168.1.1; eth.src = 00:00:00:00:01:01; outport = "lrp1"; flags.loopback = 1; next;)
+-  table=??(lr_in_ip_routing   ), priority=74   , match=(ip4.dst == 192.168.0.0/24), action=(ip.ttl--; reg8[[0..15]] = 0; reg0 = ip4.dst; reg1 = 192.168.0.1; eth.src = 00:00:00:00:00:01; outport = "lrp0"; flags.loopback = 1; next;)
+-  table=??(lr_in_ip_routing   ), priority=74   , match=(ip4.dst == 192.168.1.0/24), action=(ip.ttl--; reg8[[0..15]] = 0; reg0 = ip4.dst; reg1 = 192.168.1.1; eth.src = 00:00:00:00:01:01; outport = "lrp1"; flags.loopback = 1; next;)
+-  table=??(lr_in_ip_routing   ), priority=74   , match=(ip4.dst == 192.168.2.0/24), action=(ip.ttl--; reg8[[0..15]] = 0; reg0 = ip4.dst; reg1 = 192.168.2.1; eth.src = 00:00:00:00:02:01; outport = "lrp2"; flags.loopback = 1; next;)
+-  table=??(lr_in_ip_routing   ), priority=97   , match=(reg7 == 2 && ip4.dst == 1.1.1.1/32), action=(ip.ttl--; reg8[[0..15]] = 0; reg0 = 192.168.0.20; reg1 = 192.168.0.1; eth.src = 00:00:00:00:00:01; outport = "lrp0"; flags.loopback = 1; next;)
++  table=??(lr_in_ip_routing   ), priority=130  , match=(reg7 == 2 && ip4.dst == 1.1.1.1/32), action=(ip.ttl--; reg8[[0..15]] = 0; reg0 = 192.168.0.20; reg1 = 192.168.0.1; eth.src = 00:00:00:00:00:01; outport = "lrp0"; flags.loopback = 1; next;)
++  table=??(lr_in_ip_routing   ), priority=2    , match=(reg7 == 0 && ip4.dst == 0.0.0.0/0), action=(ip.ttl--; reg8[[0..15]] = 0; reg0 = 192.168.0.10; reg1 = 192.168.0.1; eth.src = 00:00:00:00:00:01; outport = "lrp0"; flags.loopback = 1; next;)
++  table=??(lr_in_ip_routing   ), priority=2    , match=(reg7 == 2 && ip4.dst == 0.0.0.0/0), action=(ip.ttl--; reg8[[0..15]] = 0; reg0 = 192.168.0.10; reg1 = 192.168.0.1; eth.src = 00:00:00:00:00:01; outport = "lrp0"; flags.loopback = 1; next;)
++  table=??(lr_in_ip_routing   ), priority=259  , match=(inport == "lrp0" && ip6.dst == fe80::/64), action=(ip.ttl--; reg8[[0..15]] = 0; xxreg0 = ip6.dst; xxreg1 = fe80::200:ff:fe00:1; eth.src = 00:00:00:00:00:01; outport = "lrp0"; flags.loopback = 1; next;)
++  table=??(lr_in_ip_routing   ), priority=259  , match=(inport == "lrp1" && ip6.dst == fe80::/64), action=(ip.ttl--; reg8[[0..15]] = 0; xxreg0 = ip6.dst; xxreg1 = fe80::200:ff:fe00:101; eth.src = 00:00:00:00:01:01; outport = "lrp1"; flags.loopback = 1; next;)
++  table=??(lr_in_ip_routing   ), priority=259  , match=(inport == "lrp2" && ip6.dst == fe80::/64), action=(ip.ttl--; reg8[[0..15]] = 0; xxreg0 = ip6.dst; xxreg1 = fe80::200:ff:fe00:201; eth.src = 00:00:00:00:02:01; outport = "lrp2"; flags.loopback = 1; next;)
++  table=??(lr_in_ip_routing   ), priority=98   , match=(reg7 == 1 && ip4.dst == 192.168.0.0/24), action=(ip.ttl--; reg8[[0..15]] = 0; reg0 = 192.168.1.10; reg1 = 192.168.1.1; eth.src = 00:00:00:00:01:01; outport = "lrp1"; flags.loopback = 1; next;)
++  table=??(lr_in_ip_routing   ), priority=99   , match=(ip4.dst == 192.168.0.0/24), action=(ip.ttl--; reg8[[0..15]] = 0; reg0 = ip4.dst; reg1 = 192.168.0.1; eth.src = 00:00:00:00:00:01; outport = "lrp0"; flags.loopback = 1; next;)
++  table=??(lr_in_ip_routing   ), priority=99   , match=(ip4.dst == 192.168.1.0/24), action=(ip.ttl--; reg8[[0..15]] = 0; reg0 = ip4.dst; reg1 = 192.168.1.1; eth.src = 00:00:00:00:01:01; outport = "lrp1"; flags.loopback = 1; next;)
++  table=??(lr_in_ip_routing   ), priority=99   , match=(ip4.dst == 192.168.2.0/24), action=(ip.ttl--; reg8[[0..15]] = 0; reg0 = ip4.dst; reg1 = 192.168.2.1; eth.src = 00:00:00:00:02:01; outport = "lrp2"; flags.loopback = 1; next;)
+ ])
+ 
+ AT_CLEANUP
+-- 
+2.45.2
+

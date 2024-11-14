@@ -1,0 +1,45 @@
+From 9269926abe45194a3aa69e381dc7b0d72cc8c071 Mon Sep 17 00:00:00 2001
+From: Frode Nordahl <fnordahl@ubuntu.com>
+Date: Mon, 4 Nov 2024 12:03:49 +0100
+Subject: [PATCH 03/31] northd: Find outports based on ovn_port.
+
+From: Felix Huettner <felix.huettner@stackit.cloud>
+
+Previously we searched for the outport of a route by going through all
+LRPs of the LR in the northbound, finding the matching ovn_port and
+checking if it matches. However we can also just iterate over all
+ovn_port of the LR datapath.
+
+This is simpler and a prerequisite for later patches that use
+derived router ports.
+
+Signed-off-by: Felix Huettner <felix.huettner@stackit.cloud>
+Acked-by: Lorenzo Bianconi <lorenzo.bianconi@redhat.com>
+---
+ northd/northd.c | 10 +---------
+ 1 file changed, 1 insertion(+), 9 deletions(-)
+
+diff --git a/northd/northd.c b/northd/northd.c
+index fa3a8a882..8ba7b8c33 100644
+--- a/northd/northd.c
++++ b/northd/northd.c
+@@ -11433,15 +11433,7 @@ find_static_route_outport(struct ovn_datapath *od, const struct hmap *lr_ports,
+     } else {
+         /* output_port is not specified, find the
+          * router port matching the next hop. */
+-        int i;
+-        for (i = 0; i < od->nbr->n_ports; i++) {
+-            struct nbrec_logical_router_port *lrp = od->nbr->ports[i];
+-            out_port = ovn_port_find(lr_ports, lrp->name);
+-            if (!out_port) {
+-                /* This should not happen. */
+-                continue;
+-            }
+-
++        HMAP_FOR_EACH (out_port, dp_node, &od->ports) {
+             if (route->nexthop[0]) {
+                 lrp_addr_s = find_lrp_member_ip(out_port, route->nexthop);
+             }
+-- 
+2.45.2
+

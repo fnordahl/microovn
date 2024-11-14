@@ -334,10 +334,12 @@ parts:
     plugin: autotools
     source: https://github.com/ovn-org/ovn.git
     source-type: git
-    source-tag: v24.09.0
+    source-commit: 12886fb5399c44d9ef40381cd4ac562dab0fdeba
     override-build: |
       # build OVS first
       cd ovs
+      # apply patches related to the route leaking/learning
+      git am $CRAFT_PROJECT_DIR/patches/ovs_route_table/*.patch
       ./boot.sh
       ./configure \
         --enable-ssl \
@@ -348,10 +350,9 @@ parts:
       # build OVN
       cd ..
       # apply patches related to the route leaking/learning
-      git am  $CRAFT_PROJECT_DIR/patches/route_leaking/0*.patch
-      patch -p1 < $CRAFT_PROJECT_DIR/patches/route_leaking/dont-delete-other-routes.patch
+      git am  $CRAFT_PROJECT_DIR/patches/route_leaking/*.patch
       git am  $CRAFT_PROJECT_DIR/patches/allow_ipv6_ra/*.patch
-      git am  $CRAFT_PROJECT_DIR/patches/ipv4_over_ipv6/*.patch
+      #git am  $CRAFT_PROJECT_DIR/patches/ipv4_over_ipv6/*.patch
       ./boot.sh
       ./configure \
         --prefix=/usr \

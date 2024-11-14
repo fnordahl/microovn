@@ -1,0 +1,63 @@
+From ead485fc00d9671129c14271c629018a2c5ee164 Mon Sep 17 00:00:00 2001
+From: Frode Nordahl <fnordahl@ubuntu.com>
+Date: Mon, 4 Nov 2024 12:04:19 +0100
+Subject: [PATCH 12/31] northd: Add filtering which routes to advertise.
+
+From: Felix Huettner <felix.huettner@stackit.cloud>
+
+previously all routes of a logical router where announced. However in
+some cases it makes more sense to only announce static or connected
+routes. Therefor we add options to LR and LRP to define which routes to
+advertise.
+
+Signed-off-by: Felix Huettner <felix.huettner@stackit.cloud>
+---
+ northd/en-routes-sync.c | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/northd/en-routes-sync.c b/northd/en-routes-sync.c
+index bb61e0d51..581f21b8e 100644
+--- a/northd/en-routes-sync.c
++++ b/northd/en-routes-sync.c
+@@ -15,6 +15,7 @@
+ #include <config.h>
+ 
+ #include "openvswitch/vlog.h"
++#include "smap.h"
+ #include "stopwatch.h"
+ #include "northd.h"
+ 
+@@ -128,6 +129,13 @@ route_erase_entry(struct route_entry *route_e)
+     free(route_e);
+ }
+ 
++static bool
++get_nbrp_or_nbr_option(const struct ovn_port *op, const char *key)
++{
++    return smap_get_bool(&op->nbrp->options, key,
++        smap_get_bool(&op->od->nbr->options, key, false));
++}
++
+ static void
+ routes_table_sync(struct ovsdb_idl_txn *ovnsb_txn,
+                   const struct sbrec_route_table *sbrec_route_table,
+@@ -164,6 +172,16 @@ routes_table_sync(struct ovsdb_idl_txn *ovnsb_txn,
+                            false)) {
+             continue;
+         }
++        if (route->source == ROUTE_SOURCE_CONNECTED &&
++                !get_nbrp_or_nbr_option(route->out_port,
++                                        "dynamic-routing-connected")) {
++            continue;
++        }
++        if (route->source == ROUTE_SOURCE_STATIC &&
++                !get_nbrp_or_nbr_option(route->out_port,
++                                        "dynamic-routing-static")) {
++            continue;
++        }
+         route_e = route_lookup_or_add(&sync_routes,
+                                       route->od->sb,
+                                       route->out_port->key,
+-- 
+2.45.2
+

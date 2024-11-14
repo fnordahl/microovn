@@ -1,0 +1,150 @@
+From a88c2c56862a5b4663fd0e3746edeeaa24b8ba87 Mon Sep 17 00:00:00 2001
+From: Frode Nordahl <fnordahl@ubuntu.com>
+Date: Thu, 24 Oct 2024 17:45:56 +0200
+Subject: [PATCH 2/6] netlink-notifier: Support network namespaces.
+
+From: Felix Huettner <felix.huettner@stackit.cloud>
+
+extend network namespace support also to the netlink-notifier.
+This is needed on the OVN side for watching routes.
+
+Signed-off-by: Felix Huettner <felix.huettner@stackit.cloud>
+---
+ lib/netlink-notifier.c         | 10 ++++++++--
+ lib/netlink-notifier.h         |  3 ++-
+ lib/netlink-socket.c           |  2 +-
+ lib/netlink-socket.h           |  1 +
+ lib/route-table.c              |  3 ++-
+ lib/rtnetlink.c                |  2 +-
+ tests/test-netlink-conntrack.c |  2 +-
+ 7 files changed, 16 insertions(+), 7 deletions(-)
+
+diff --git a/lib/netlink-notifier.c b/lib/netlink-notifier.c
+index 7ea5a4181..3089f81c6 100644
+--- a/lib/netlink-notifier.c
++++ b/lib/netlink-notifier.c
+@@ -38,6 +38,7 @@ struct nln {
+     bool has_run;                /* Guard for run and wait functions. */
+ 
+     /* Passed in by nln_create(). */
++    char *netns;                 /* The network namespace. */
+     int protocol;                /* Protocol passed to nl_sock_create(). */
+     nln_parse_func *parse;       /* Message parsing function. */
+     void *change;                /* Change passed to parse. */
+@@ -58,12 +59,16 @@ struct nln_notifier {
+  * Incoming messages will be parsed with 'parse' which will be passed 'change'
+  * as an argument. */
+ struct nln *
+-nln_create(int protocol, nln_parse_func *parse, void *change)
++nln_create(const char *netns, int protocol, nln_parse_func *parse,
++           void *change)
+ {
+     struct nln *nln;
+ 
+     nln = xzalloc(sizeof *nln);
+     nln->notify_sock = NULL;
++    if (netns) {
++        nln->netns = xstrdup(netns);
++    }
+     nln->protocol = protocol;
+     nln->parse = parse;
+     nln->change = change;
+@@ -84,6 +89,7 @@ nln_destroy(struct nln *nln)
+     if (nln) {
+         ovs_assert(ovs_list_is_empty(&nln->all_notifiers));
+         nl_sock_destroy(nln->notify_sock);
++        free(nln->netns);
+         free(nln);
+     }
+ }
+@@ -106,7 +112,7 @@ nln_notifier_create(struct nln *nln, int multicast_group, nln_notify_func *cb,
+     if (!nln->notify_sock) {
+         struct nl_sock *sock;
+ 
+-        error = nl_sock_create(nln->protocol, &sock);
++        error = nl_sock_ns_create(nln->netns, nln->protocol, &sock);
+         if (error) {
+             VLOG_WARN("could not create netlink socket: %s",
+                       ovs_strerror(error));
+diff --git a/lib/netlink-notifier.h b/lib/netlink-notifier.h
+index dd0c183de..913883bab 100644
+--- a/lib/netlink-notifier.h
++++ b/lib/netlink-notifier.h
+@@ -41,7 +41,8 @@ typedef void nln_notify_func(const void *change, void *aux);
+  */
+ typedef int nln_parse_func(struct ofpbuf *buf, void *change);
+ 
+-struct nln *nln_create(int protocol, nln_parse_func *, void *change);
++struct nln *nln_create(const char *netns, int protocol,
++                       nln_parse_func *, void *change);
+ void nln_destroy(struct nln *);
+ struct nln_notifier *nln_notifier_create(struct nln *, int multicast_group,
+                                          nln_notify_func *, void *aux);
+diff --git a/lib/netlink-socket.c b/lib/netlink-socket.c
+index 801b4badd..f08473f40 100644
+--- a/lib/netlink-socket.c
++++ b/lib/netlink-socket.c
+@@ -1742,7 +1742,7 @@ static struct ovs_mutex pool_mutex = OVS_MUTEX_INITIALIZER;
+ static struct shash pools OVS_GUARDED_BY(pool_mutex) =
+                                 SHASH_INITIALIZER(&pools);
+ 
+-static int
++int
+ nl_sock_ns_create(const char *netns, int protocol, struct nl_sock **sockp) {
+     int ret, ns_fd, ns_default_fd, err;
+     if (netns) {
+diff --git a/lib/netlink-socket.h b/lib/netlink-socket.h
+index e4d645a62..7e5be14ef 100644
+--- a/lib/netlink-socket.h
++++ b/lib/netlink-socket.h
+@@ -255,6 +255,7 @@ int nl_transact(const char *netns, int protocol, const struct ofpbuf *request,
+                 struct ofpbuf **replyp);
+ void nl_transact_multiple(const char *netns, int protocol,
+                           struct nl_transaction **, size_t n);
++int nl_sock_ns_create(const char *netns, int protocol, struct nl_sock **sockp);
+ 
+ /* Table dumping. */
+ #define NL_DUMP_BUFSIZE         4096
+diff --git a/lib/route-table.c b/lib/route-table.c
+index d5d98585e..de573634d 100644
+--- a/lib/route-table.c
++++ b/lib/route-table.c
+@@ -110,7 +110,8 @@ route_table_init(void)
+     ovs_assert(!route6_notifier);
+ 
+     ovs_router_init();
+-    nln = nln_create(NETLINK_ROUTE, route_table_parse, &rtmsg);
++    nln = nln_create(NULL, NETLINK_ROUTE,
++                     route_table_parse, &rtmsg);
+ 
+     route_notifier =
+         nln_notifier_create(nln, RTNLGRP_IPV4_ROUTE,
+diff --git a/lib/rtnetlink.c b/lib/rtnetlink.c
+index 37078d00e..9c8d4df8a 100644
+--- a/lib/rtnetlink.c
++++ b/lib/rtnetlink.c
+@@ -210,7 +210,7 @@ struct nln_notifier *
+ rtnetlink_notifier_create(rtnetlink_notify_func *cb, void *aux)
+ {
+     if (!nln) {
+-        nln = nln_create(NETLINK_ROUTE, rtnetlink_parse_cb, &rtn_change);
++        nln = nln_create(NULL, NETLINK_ROUTE, rtnetlink_parse_cb, &rtn_change);
+     }
+ 
+     return nln_notifier_create(nln, RTNLGRP_LINK, (nln_notify_func *) cb, aux);
+diff --git a/tests/test-netlink-conntrack.c b/tests/test-netlink-conntrack.c
+index 2a62615b2..2f8962a02 100644
+--- a/tests/test-netlink-conntrack.c
++++ b/tests/test-netlink-conntrack.c
+@@ -80,7 +80,7 @@ test_nl_ct_monitor(struct ovs_cmdl_context *ctx OVS_UNUSED)
+ 
+     unsigned i;
+ 
+-    nln = nln_create(NETLINK_NETFILTER, event_parse, &change);
++    nln = nln_create(NULL, NETLINK_NETFILTER, event_parse, &change);
+ 
+     for (i = 0; i < ARRAY_SIZE(groups); i++) {
+         notifiers[i] = nln_notifier_create(nln, groups[i], event_print, NULL);
+-- 
+2.45.2
+

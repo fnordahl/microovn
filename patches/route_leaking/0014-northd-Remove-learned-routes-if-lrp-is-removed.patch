@@ -1,0 +1,137 @@
+From 3daba17e0e5c6118dbf539ceca8a84fffbe57cdd Mon Sep 17 00:00:00 2001
+From: Frode Nordahl <fnordahl@ubuntu.com>
+Date: Mon, 4 Nov 2024 12:04:23 +0100
+Subject: [PATCH 14/31] northd: Remove learned routes if lrp is removed.
+
+From: Felix Huettner <felix.huettner@stackit.cloud>
+
+learned routes must be bound to a lrp on which the routes where learned.
+In case the lrp is deleted for whatever reason no ovn-controller would
+clean these routes up, therefor we do this in northd.
+
+Signed-off-by: Felix Huettner <felix.huettner@stackit.cloud>
+---
+ northd/en-northd.c       |  2 ++
+ northd/inc-proc-northd.c |  1 +
+ northd/northd.c          | 31 ++++++++++++++++++++++++++++---
+ northd/northd.h          |  1 +
+ 4 files changed, 32 insertions(+), 3 deletions(-)
+
+diff --git a/northd/en-northd.c b/northd/en-northd.c
+index 6e90336f6..8152ccbcf 100644
+--- a/northd/en-northd.c
++++ b/northd/en-northd.c
+@@ -101,6 +101,8 @@ northd_get_input_data(struct engine_node *node,
+         EN_OVSDB_GET(engine_get_input("SB_chassis_template_var", node));
+     input_data->sbrec_mirror_table =
+         EN_OVSDB_GET(engine_get_input("SB_mirror", node));
++    input_data->sbrec_route_table =
++        EN_OVSDB_GET(engine_get_input("SB_route", node));
+ 
+     struct ed_type_lb_data *lb_data =
+         engine_get_input_data("lb_data", node);
+diff --git a/northd/inc-proc-northd.c b/northd/inc-proc-northd.c
+index 741295709..59cb50853 100644
+--- a/northd/inc-proc-northd.c
++++ b/northd/inc-proc-northd.c
+@@ -204,6 +204,7 @@ void inc_proc_northd_init(struct ovsdb_idl_loop *nb,
+     engine_add_input(&en_northd, &en_sb_service_monitor, NULL);
+     engine_add_input(&en_northd, &en_sb_static_mac_binding, NULL);
+     engine_add_input(&en_northd, &en_sb_chassis_template_var, NULL);
++    engine_add_input(&en_northd, &en_sb_route, NULL);
+     engine_add_input(&en_northd, &en_sb_fdb, northd_sb_fdb_change_handler);
+     engine_add_input(&en_northd, &en_global_config,
+                      northd_global_config_handler);
+diff --git a/northd/northd.c b/northd/northd.c
+index b4412e70c..d93137a2d 100644
+--- a/northd/northd.c
++++ b/northd/northd.c
+@@ -3417,6 +3417,28 @@ cleanup_mac_bindings(
+     }
+ }
+ 
++/* Remove received route entries that refer to logical_ports which are
++ * deleted. */
++static void
++cleanup_routes(
++    const struct sbrec_route_table *sbrec_route_table,
++    struct hmap *lr_datapaths, struct hmap *lr_ports)
++{
++    const struct sbrec_route *r;
++    SBREC_ROUTE_TABLE_FOR_EACH_SAFE (r, sbrec_route_table) {
++        const struct ovn_datapath *od =
++            ovn_datapath_from_sbrec(NULL, lr_datapaths, r->datapath);
++        if (strcmp(r->type, "receive")) {
++            continue;
++        }
++
++        if (!od || ovn_datapath_is_stale(od) ||
++                !ovn_port_find(lr_ports, r->logical_port)) {
++            sbrec_route_delete(r);
++        }
++    }
++}
++
+ static void
+ cleanup_sb_ha_chassis_groups(
+     const struct sbrec_ha_chassis_group_table *sbrec_ha_chassis_group_table,
+@@ -4220,6 +4242,7 @@ build_ports(struct ovsdb_idl_txn *ovnsb_txn,
+     const struct sbrec_mirror_table *sbrec_mirror_table,
+     const struct sbrec_mac_binding_table *sbrec_mac_binding_table,
+     const struct sbrec_ha_chassis_group_table *sbrec_ha_chassis_group_table,
++    const struct sbrec_route_table *sbrec_route_table,
+     struct ovsdb_idl_index *sbrec_chassis_by_name,
+     struct ovsdb_idl_index *sbrec_chassis_by_hostname,
+     struct ovsdb_idl_index *sbrec_ha_chassis_grp_by_name,
+@@ -4245,7 +4268,7 @@ build_ports(struct ovsdb_idl_txn *ovnsb_txn,
+                        &tag_alloc_table, &sb_only, &nb_only, &both);
+ 
+     /* Purge stale Mac_Bindings if ports are deleted. */
+-    bool remove_mac_bindings = !ovs_list_is_empty(&sb_only);
++    bool any_sb_port_deleted = !ovs_list_is_empty(&sb_only);
+ 
+     /* Assign explicitly requested tunnel ids first. */
+     struct ovn_port *op;
+@@ -4287,7 +4310,7 @@ build_ports(struct ovsdb_idl_txn *ovnsb_txn,
+          * Mac_Bindings are purged.
+          */
+         if (op->od->sb != op->sb->datapath) {
+-            remove_mac_bindings = true;
++            any_sb_port_deleted = true;
+         }
+         if (op->nbsp) {
+             tag_alloc_create_new_tag(&tag_alloc_table, op->nbsp);
+@@ -4333,8 +4356,9 @@ build_ports(struct ovsdb_idl_txn *ovnsb_txn,
+         hmap_insert(lr_ports, &op->key_node, op->key_node.hash);
+     }
+ 
+-    if (remove_mac_bindings) {
++    if (any_sb_port_deleted) {
+         cleanup_mac_bindings(sbrec_mac_binding_table, lr_datapaths, lr_ports);
++        cleanup_routes(sbrec_route_table, lr_datapaths, lr_ports);
+     }
+ 
+     tag_alloc_destroy(&tag_alloc_table);
+@@ -19021,6 +19045,7 @@ ovnnb_db_run(struct northd_input *input_data,
+                 input_data->sbrec_mirror_table,
+                 input_data->sbrec_mac_binding_table,
+                 input_data->sbrec_ha_chassis_group_table,
++                input_data->sbrec_route_table,
+                 input_data->sbrec_chassis_by_name,
+                 input_data->sbrec_chassis_by_hostname,
+                 input_data->sbrec_ha_chassis_grp_by_name,
+diff --git a/northd/northd.h b/northd/northd.h
+index 126d58626..7b318087a 100644
+--- a/northd/northd.h
++++ b/northd/northd.h
+@@ -51,6 +51,7 @@ struct northd_input {
+     const struct sbrec_chassis_template_var_table
+         *sbrec_chassis_template_var_table;
+     const struct sbrec_mirror_table *sbrec_mirror_table;
++    const struct sbrec_route_table *sbrec_route_table;
+ 
+     /* Northd lb data node inputs*/
+     const struct hmap *lbs;
+-- 
+2.45.2
+

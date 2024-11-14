@@ -1,0 +1,284 @@
+From b881ca9ef5edfffc998fd2222b129f172ab0a9ac Mon Sep 17 00:00:00 2001
+From: Frode Nordahl <fnordahl@ubuntu.com>
+Date: Mon, 4 Nov 2024 12:04:57 +0100
+Subject: [PATCH 30/31] controller: Allow filtering routes on ifindex.
+
+From: Felix Huettner <felix.huettner@stackit.cloud>
+
+previously if a single chassis has multiple LRPs of a LR bound then the
+routes learned would be shared by all of these LRPs. However potentially
+only some of the LRPs have actually received this route.
+
+To allow for filtering we allow the user to define the ifindex of each
+interface and thereby learn routes individually per LRP.
+
+Signed-off-by: Felix Huettner <felix.huettner@stackit.cloud>
+---
+ controller/route-exchange-netlink.c |  1 +
+ controller/route-exchange-netlink.h |  1 +
+ controller/route-exchange.c         | 19 +++++++++++++------
+ controller/route.c                  |  9 ++++++---
+ controller/route.h                  |  6 ++++--
+ lib/ovn-util.c                      | 20 +++++++++++++++++---
+ lib/ovn-util.h                      |  3 ++-
+ northd/northd.c                     | 10 ++++++++++
+ northd/northd.h                     |  4 +++-
+ 9 files changed, 57 insertions(+), 16 deletions(-)
+
+diff --git a/controller/route-exchange-netlink.c b/controller/route-exchange-netlink.c
+index 832c62686..d126f8357 100644
+--- a/controller/route-exchange-netlink.c
++++ b/controller/route-exchange-netlink.c
+@@ -225,6 +225,7 @@ handle_route_msg_delete_routes(const struct route_table_msg *msg, void *data)
+             rr->addr = rd->rta_dst;
+             rr->plen = rd->plen;
+             rr->nexthop = rd->nexthops[i].rta_gw;
++            rr->ifindex = rd->nexthops[i].ifindex;
+         }
+         return;
+     }
+diff --git a/controller/route-exchange-netlink.h b/controller/route-exchange-netlink.h
+index f3059e5af..fb76b9a21 100644
+--- a/controller/route-exchange-netlink.h
++++ b/controller/route-exchange-netlink.h
+@@ -32,6 +32,7 @@ struct re_nl_received_route_node {
+     struct in6_addr addr;
+     unsigned int plen;
+     struct in6_addr nexthop;
++    unsigned int ifindex;
+ };
+ 
+ char * re_nl_get_netns_name(uint32_t table_id);
+diff --git a/controller/route-exchange.c b/controller/route-exchange.c
+index 2eeabb5ec..c1304cd91 100644
+--- a/controller/route-exchange.c
++++ b/controller/route-exchange.c
+@@ -29,6 +29,7 @@
+ #include "route-table-notify.h"
+ #include "route-exchange.h"
+ #include "route-exchange-netlink.h"
++#include "simap.h"
+ 
+ 
+ VLOG_DEFINE_THIS_MODULE(route_exchange);
+@@ -145,7 +146,7 @@ route_erase_entry(struct route_entry *route_e)
+ static void
+ sb_sync_learned_routes(const struct sbrec_datapath_binding *datapath,
+                        const struct hmap *learned_routes,
+-                       const struct sset *bound_ports,
++                       const struct simap *bound_ports,
+                        struct ovsdb_idl_txn *ovnsb_idl_txn,
+                        struct ovsdb_idl_index *sbrec_route_by_datapath)
+ {
+@@ -162,7 +163,7 @@ sb_sync_learned_routes(const struct sbrec_datapath_binding *datapath,
+         }
+         /* If the port is not local we don't care about it.
+          * Some other ovn-controller will handle it. */
+-        if (!sset_contains(bound_ports, sb_route->logical_port)) {
++        if (!simap_contains(bound_ports, sb_route->logical_port)) {
+             continue;
+         }
+         route_e = route_alloc_entry(&sync_routes,
+@@ -181,16 +182,22 @@ sb_sync_learned_routes(const struct sbrec_datapath_binding *datapath,
+                                                learned_route->plen);
+         char *nexthop = normalize_v46(&learned_route->nexthop);
+ 
+-        const char *logical_port;
+-        SSET_FOR_EACH (logical_port, bound_ports) {
++        struct simap_node *port_node;
++        SIMAP_FOR_EACH (port_node, bound_ports) {
++            /* The user specified an ifindex, but we learned it on a different
++             * port. */
++            if (port_node->data && port_node->data != learned_route->ifindex) {
++                continue;
++            }
+             route_e = route_lookup_or_add(&sync_routes,
+                 datapath,
+-                logical_port, ip_prefix, nexthop);
++                port_node->name, ip_prefix, nexthop);
+             route_e->stale = false;
+             if (!route_e->sb_route) {
+                 sb_route = sbrec_route_insert(ovnsb_idl_txn);
+                 sbrec_route_set_datapath(sb_route, datapath);
+-                sbrec_route_set_logical_port(sb_route, logical_port);
++                sbrec_route_set_logical_port(sb_route,
++                                             port_node->name);
+                 sbrec_route_set_ip_prefix(sb_route, ip_prefix);
+                 sbrec_route_set_nexthop(sb_route, nexthop);
+                 sbrec_route_set_type(sb_route, "receive");
+diff --git a/controller/route.c b/controller/route.c
+index 3af7b8859..dabe78800 100644
+--- a/controller/route.c
++++ b/controller/route.c
+@@ -91,7 +91,7 @@ advertise_datapath_cleanup(struct advertise_datapath_entry *ad)
+         free(ar);
+     }
+     hmap_destroy(&ad->routes);
+-    sset_destroy(&ad->bound_ports);
++    simap_destroy(&ad->bound_ports);
+     free(ad);
+ }
+ 
+@@ -110,7 +110,7 @@ route_run(struct route_ctx_in *r_ctx_in,
+         ad->key = ld->datapath->tunnel_key;
+         ad->db = ld->datapath;
+         hmap_init(&ad->routes);
+-        sset_init(&ad->bound_ports);
++        simap_init(&ad->bound_ports);
+ 
+         /* This is a LR datapath, find LRPs with route exchange options
+          * that are bound locally. */
+@@ -130,8 +130,11 @@ route_run(struct route_ctx_in *r_ctx_in,
+                                           "maintain-vrf", false);
+             ad->use_netns |= smap_get_bool(&sb_crp->options,
+                                        "use-netns", false);
++            unsigned int ifindex = smap_get_uint(&sb_crp->options,
++                                                 "dynamic-routing-ifindex",
++                                                 0);
+             relevant_datapath = true;
+-            sset_add(&ad->bound_ports, local_peer->logical_port);
++            simap_put(&ad->bound_ports, local_peer->logical_port, ifindex);
+         }
+ 
+         if (!relevant_datapath) {
+diff --git a/controller/route.h b/controller/route.h
+index b5aab50cb..a039474f9 100644
+--- a/controller/route.h
++++ b/controller/route.h
+@@ -19,6 +19,7 @@
+ #include <netinet/in.h>
+ #include "openvswitch/hmap.h"
+ #include "sset.h"
++#include "simap.h"
+ 
+ struct hmap;
+ struct ovsdb_idl_index;
+@@ -51,8 +52,9 @@ struct advertise_datapath_entry {
+     bool use_netns;
+     struct hmap routes;
+     /* the name of the port bindings locally bound for this datapath and
+-     * running route exchange logic. */
+-    struct sset bound_ports;
++     * running route exchange logic.
++     * The key is the port name and the value is the ifindex if set. */
++    struct simap bound_ports;
+ };
+ 
+ struct advertise_route_entry {
+diff --git a/lib/ovn-util.c b/lib/ovn-util.c
+index c86f6f209..4218de77d 100644
+--- a/lib/ovn-util.c
++++ b/lib/ovn-util.c
+@@ -1089,7 +1089,8 @@ chassis_find_active_active_networks(const struct sbrec_chassis *chassis,
+     /* Structure
+      * ovn-active-active-mappings="<network>|<network>"
+      * network="<network_name>;<port>;<port>"
+-     * port="<mac>,<ip>" */
++     * port="<mac>,<ip>,<ifindex>"
++     * ifindex is optional */
+     nextnet = start = xstrdup(aa_ports);
+     while ((curnet = strsep(&nextnet, "|")) && *curnet) {
+         nextport = curnet;
+@@ -1101,10 +1102,11 @@ chassis_find_active_active_networks(const struct sbrec_chassis *chassis,
+         chassis_aa_network->network_name = xstrdup(network);
+         chassis_aa_network->n_addresses = 0;
+         while ((curport = strsep(&nextport, ";")) && *curport) {
+-            char *mac, *ip;
++            char *mac, *ip, *ifindex;
+ 
+             mac = strsep(&curport, ",");
+-            ip = curport;
++            ip = strsep(&curport, ",");
++            ifindex = curport;
+ 
+             if (!mac || !ip || !*mac || !*ip) {
+                 VLOG_ERR("Invalid format for "
+@@ -1163,6 +1165,18 @@ chassis_find_active_active_networks(const struct sbrec_chassis *chassis,
+                     continue;
+                 }
+             }
++
++            chassis_aa_network->ifindexes = xrealloc(
++                chassis_aa_network->ifindexes,
++                (chassis_aa_network->n_addresses + 1
++                 ) * sizeof *chassis_aa_network->ifindexes);
++            uint32_t ifindex_i = 0;
++            if (ifindex) {
++                ifindex_i = atoi(ifindex);
++            }
++            chassis_aa_network->ifindexes[
++                chassis_aa_network->n_addresses] = ifindex_i;
++
+             chassis_aa_network->n_addresses++;
+         }
+     }
+diff --git a/lib/ovn-util.h b/lib/ovn-util.h
+index 24ee55a9c..312629bd9 100644
+--- a/lib/ovn-util.h
++++ b/lib/ovn-util.h
+@@ -354,8 +354,9 @@ char *lr_lb_address_set_ref(uint32_t lr_tunnel_key, int addr_family);
+ 
+ struct chassis_aa_network {
+     char *network_name;
+-    struct lport_addresses *addresses;
+     size_t n_addresses;
++    struct lport_addresses *addresses;
++    uint32_t *ifindexes;
+ };
+ 
+ bool chassis_find_active_active_networks(const struct sbrec_chassis *,
+diff --git a/northd/northd.c b/northd/northd.c
+index 05edb1cad..aa748b4f2 100644
+--- a/northd/northd.c
++++ b/northd/northd.c
+@@ -2653,6 +2653,7 @@ join_logical_ports(const struct sbrec_port_binding_table *sbrec_pb_table,
+                 lsp->aa_chassis_name = xstrdup(chassis->name);
+                 lrp->aa_chassis_index = j;
+                 lsp->aa_chassis_index = j;
++                lrp->aa_ifindex = networks.ifindexes[j];
+ 
+                 if (nbsp_rpr) {
+                     char *lsp_rpr_name = xasprintf("%s-%s-%"PRIuSIZE,
+@@ -2668,6 +2669,7 @@ join_logical_ports(const struct sbrec_port_binding_table *sbrec_pb_table,
+             }
+             free(networks.network_name);
+             free(networks.addresses);
++            free(networks.ifindexes);
+         }
+     }
+ 
+@@ -4392,6 +4394,14 @@ sync_pb_for_lrp(struct ovn_port *op,
+         if (smap_get_bool(&op->od->nbr->options, "dynamic-routing", false)) {
+             smap_add(&new, "dynamic-routing", "true");
+         }
++        uint32_t ifindex = op->aa_ifindex;
++        if (!ifindex && op->primary_port) {
++            ifindex = op->primary_port->aa_ifindex;
++        }
++        if (ifindex) {
++            smap_add_nocopy(&new, xstrdup("dynamic-routing-ifindex"),
++                            xasprintf("%u", ifindex));
++        }
+     }
+ 
+ 
+diff --git a/northd/northd.h b/northd/northd.h
+index 12fe83440..51abddd43 100644
+--- a/northd/northd.h
++++ b/northd/northd.h
+@@ -670,9 +670,11 @@ struct ovn_port {
+     bool is_active_active;
+     char *aa_chassis_name;
+     size_t aa_chassis_index;
+-    /* The following value is only set on the lrp side of an
++    /* The following two values are only set on the lrp side of an
+      * active-active port binding */
+     char *aa_mac;
++    /* This is 0 if not set by the user */
++    uint32_t aa_ifindex;
+ 
+     /* Reference of lflows generated for this ovn_port.
+      *
+-- 
+2.45.2
+

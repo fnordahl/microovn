@@ -1,0 +1,295 @@
+From f8e007d49f1aaf4d880edbc89ac5f894adbf333e Mon Sep 17 00:00:00 2001
+From: Frode Nordahl <fnordahl@ubuntu.com>
+Date: Mon, 4 Nov 2024 12:04:04 +0100
+Subject: [PATCH 07/31] northd: Rename en_static_routes to en_routes.
+
+From: Felix Huettner <felix.huettner@stackit.cloud>
+
+this engine node will in the future also handle routes created as part
+of the LRP network property. Therefor rename it to make it clear that it
+handles all routes.
+
+Signed-off-by: Felix Huettner <felix.huettner@stackit.cloud>
+Acked-by: Lorenzo Bianconi <lorenzo.bianconi@redhat.com>
+---
+ northd/en-lflow.c        |  8 ++++----
+ northd/en-northd.c       | 34 +++++++++++++++++-----------------
+ northd/en-northd.h       |  8 ++++----
+ northd/inc-proc-northd.c | 12 ++++++------
+ northd/northd.c          |  4 ++--
+ northd/northd.h          |  6 +++---
+ tests/ovn-northd.at      |  6 +++---
+ 7 files changed, 39 insertions(+), 39 deletions(-)
+
+diff --git a/northd/en-lflow.c b/northd/en-lflow.c
+index 469d7c6b5..fa1f0236d 100644
+--- a/northd/en-lflow.c
++++ b/northd/en-lflow.c
+@@ -44,8 +44,8 @@ lflow_get_input_data(struct engine_node *node,
+     struct northd_data *northd_data = engine_get_input_data("northd", node);
+     struct bfd_sync_data *bfd_sync_data =
+         engine_get_input_data("bfd_sync", node);
+-    struct static_routes_data *static_routes_data =
+-        engine_get_input_data("static_routes", node);
++    struct routes_data *routes_data =
++        engine_get_input_data("routes", node);
+     struct route_policies_data *route_policies_data =
+         engine_get_input_data("route_policies", node);
+     struct port_group_data *pg_data =
+@@ -82,8 +82,8 @@ lflow_get_input_data(struct engine_node *node,
+     lflow_input->lb_datapaths_map = &northd_data->lb_datapaths_map;
+     lflow_input->svc_monitor_map = &northd_data->svc_monitor_map;
+     lflow_input->bfd_ports = &bfd_sync_data->bfd_ports;
+-    lflow_input->parsed_routes = &static_routes_data->parsed_routes;
+-    lflow_input->route_tables = &static_routes_data->route_tables;
++    lflow_input->parsed_routes = &routes_data->parsed_routes;
++    lflow_input->route_tables = &routes_data->route_tables;
+     lflow_input->route_policies = &route_policies_data->route_policies;
+ 
+     struct ed_type_global_config *global_config =
+diff --git a/northd/en-northd.c b/northd/en-northd.c
+index 24ed31517..6e90336f6 100644
+--- a/northd/en-northd.c
++++ b/northd/en-northd.c
+@@ -287,7 +287,7 @@ en_route_policies_run(struct engine_node *node, void *data)
+ }
+ 
+ bool
+-static_routes_northd_change_handler(struct engine_node *node,
++routes_northd_change_handler(struct engine_node *node,
+                                     void *data OVS_UNUSED)
+ {
+     struct northd_data *northd_data = engine_get_input_data("northd", node);
+@@ -316,29 +316,29 @@ static_routes_northd_change_handler(struct engine_node *node,
+ }
+ 
+ void
+-en_static_routes_run(struct engine_node *node, void *data)
++en_routes_run(struct engine_node *node, void *data)
+ {
+     struct northd_data *northd_data = engine_get_input_data("northd", node);
+     struct bfd_data *bfd_data = engine_get_input_data("bfd", node);
+-    struct static_routes_data *static_routes_data = data;
++    struct routes_data *routes_data = data;
+ 
+-    static_routes_destroy(data);
+-    static_routes_init(data);
++    routes_destroy(data);
++    routes_init(data);
+ 
+     struct ovn_datapath *od;
+     HMAP_FOR_EACH (od, key_node, &northd_data->lr_datapaths.datapaths) {
+         for (int i = 0; i < od->nbr->n_ports; i++) {
+             const char *route_table_name =
+                 smap_get(&od->nbr->ports[i]->options, "route_table");
+-            get_route_table_id(&static_routes_data->route_tables,
++            get_route_table_id(&routes_data->route_tables,
+                                route_table_name);
+         }
+ 
+         build_parsed_routes(od, &northd_data->lr_ports,
+                             &bfd_data->bfd_connections,
+-                            &static_routes_data->parsed_routes,
+-                            &static_routes_data->route_tables,
+-                            &static_routes_data->bfd_active_connections);
++                            &routes_data->parsed_routes,
++                            &routes_data->route_tables,
++                            &routes_data->bfd_active_connections);
+     }
+ 
+     engine_set_node_state(node, EN_UPDATED);
+@@ -388,8 +388,8 @@ en_bfd_sync_run(struct engine_node *node, void *data)
+     struct bfd_data *bfd_data = engine_get_input_data("bfd", node);
+     struct route_policies_data *route_policies_data
+         = engine_get_input_data("route_policies", node);
+-    struct static_routes_data *static_routes_data
+-        = engine_get_input_data("static_routes", node);
++    struct routes_data *routes_data
++        = engine_get_input_data("routes", node);
+     const struct nbrec_bfd_table *nbrec_bfd_table =
+         EN_OVSDB_GET(engine_get_input("NB_bfd", node));
+     struct bfd_sync_data *bfd_sync_data = data;
+@@ -399,7 +399,7 @@ en_bfd_sync_run(struct engine_node *node, void *data)
+     bfd_table_sync(eng_ctx->ovnsb_idl_txn, nbrec_bfd_table,
+                    &northd_data->lr_ports, &bfd_data->bfd_connections,
+                    &route_policies_data->bfd_active_connections,
+-                   &static_routes_data->bfd_active_connections,
++                   &routes_data->bfd_active_connections,
+                    &bfd_sync_data->bfd_ports);
+     engine_set_node_state(node, EN_UPDATED);
+ }
+@@ -426,12 +426,12 @@ void
+ }
+ 
+ void
+-*en_static_routes_init(struct engine_node *node OVS_UNUSED,
++*en_routes_init(struct engine_node *node OVS_UNUSED,
+                       struct engine_arg *arg OVS_UNUSED)
+ {
+-    struct static_routes_data *data = xzalloc(sizeof *data);
++    struct routes_data *data = xzalloc(sizeof *data);
+ 
+-    static_routes_init(data);
++    routes_init(data);
+     return data;
+ }
+ 
+@@ -510,9 +510,9 @@ en_route_policies_cleanup(void *data)
+ }
+ 
+ void
+-en_static_routes_cleanup(void *data)
++en_routes_cleanup(void *data)
+ {
+-    static_routes_destroy(data);
++    routes_destroy(data);
+ }
+ 
+ void
+diff --git a/northd/en-northd.h b/northd/en-northd.h
+index 631a7c17a..b676a0ad3 100644
+--- a/northd/en-northd.h
++++ b/northd/en-northd.h
+@@ -20,7 +20,7 @@ bool northd_nb_logical_router_handler(struct engine_node *, void *data);
+ bool northd_sb_port_binding_handler(struct engine_node *, void *data);
+ bool northd_lb_data_handler(struct engine_node *, void *data);
+ bool northd_sb_fdb_change_handler(struct engine_node *node, void *data);
+-void *en_static_routes_init(struct engine_node *node OVS_UNUSED,
++void *en_routes_init(struct engine_node *node OVS_UNUSED,
+                             struct engine_arg *arg OVS_UNUSED);
+ void en_route_policies_cleanup(void *data);
+ bool route_policies_northd_change_handler(struct engine_node *node,
+@@ -28,10 +28,10 @@ bool route_policies_northd_change_handler(struct engine_node *node,
+ void en_route_policies_run(struct engine_node *node, void *data);
+ void *en_route_policies_init(struct engine_node *node OVS_UNUSED,
+                              struct engine_arg *arg OVS_UNUSED);
+-void en_static_routes_cleanup(void *data);
+-bool static_routes_northd_change_handler(struct engine_node *node,
++void en_routes_cleanup(void *data);
++bool routes_northd_change_handler(struct engine_node *node,
+                                          void *data OVS_UNUSED);
+-void en_static_routes_run(struct engine_node *node, void *data);
++void en_routes_run(struct engine_node *node, void *data);
+ void *en_bfd_init(struct engine_node *node OVS_UNUSED,
+                   struct engine_arg *arg OVS_UNUSED);
+ void en_bfd_cleanup(void *data);
+diff --git a/northd/inc-proc-northd.c b/northd/inc-proc-northd.c
+index 8c834facb..ddc16428a 100644
+--- a/northd/inc-proc-northd.c
++++ b/northd/inc-proc-northd.c
+@@ -159,7 +159,7 @@ static ENGINE_NODE_WITH_CLEAR_TRACK_DATA(lr_nat, "lr_nat");
+ static ENGINE_NODE_WITH_CLEAR_TRACK_DATA(lr_stateful, "lr_stateful");
+ static ENGINE_NODE_WITH_CLEAR_TRACK_DATA(ls_stateful, "ls_stateful");
+ static ENGINE_NODE(route_policies, "route_policies");
+-static ENGINE_NODE(static_routes, "static_routes");
++static ENGINE_NODE(routes, "routes");
+ static ENGINE_NODE(bfd, "bfd");
+ static ENGINE_NODE(bfd_sync, "bfd_sync");
+ 
+@@ -254,13 +254,13 @@ void inc_proc_northd_init(struct ovsdb_idl_loop *nb,
+     engine_add_input(&en_route_policies, &en_northd,
+                      route_policies_northd_change_handler);
+ 
+-    engine_add_input(&en_static_routes, &en_bfd, NULL);
+-    engine_add_input(&en_static_routes, &en_northd,
+-                     static_routes_northd_change_handler);
++    engine_add_input(&en_routes, &en_bfd, NULL);
++    engine_add_input(&en_routes, &en_northd,
++                     routes_northd_change_handler);
+ 
+     engine_add_input(&en_bfd_sync, &en_bfd, NULL);
+     engine_add_input(&en_bfd_sync, &en_nb_bfd, NULL);
+-    engine_add_input(&en_bfd_sync, &en_static_routes, NULL);
++    engine_add_input(&en_bfd_sync, &en_routes, NULL);
+     engine_add_input(&en_bfd_sync, &en_route_policies, NULL);
+     engine_add_input(&en_bfd_sync, &en_northd, bfd_sync_northd_change_handler);
+ 
+@@ -276,7 +276,7 @@ void inc_proc_northd_init(struct ovsdb_idl_loop *nb,
+     engine_add_input(&en_lflow, &en_sb_logical_dp_group, NULL);
+     engine_add_input(&en_lflow, &en_bfd_sync, NULL);
+     engine_add_input(&en_lflow, &en_route_policies, NULL);
+-    engine_add_input(&en_lflow, &en_static_routes, NULL);
++    engine_add_input(&en_lflow, &en_routes, NULL);
+     engine_add_input(&en_lflow, &en_global_config,
+                      node_global_config_handler);
+ 
+diff --git a/northd/northd.c b/northd/northd.c
+index 5c48503e3..1265e3c81 100644
+--- a/northd/northd.c
++++ b/northd/northd.c
+@@ -18767,7 +18767,7 @@ route_policies_init(struct route_policies_data *data)
+ }
+ 
+ void
+-static_routes_init(struct static_routes_data *data)
++routes_init(struct routes_data *data)
+ {
+     hmap_init(&data->parsed_routes);
+     simap_init(&data->route_tables);
+@@ -18861,7 +18861,7 @@ route_policies_destroy(struct route_policies_data *data)
+ }
+ 
+ void
+-static_routes_destroy(struct static_routes_data *data)
++routes_destroy(struct routes_data *data)
+ {
+     struct parsed_route *r;
+     HMAP_FOR_EACH_POP (r, key_node, &data->parsed_routes) {
+diff --git a/northd/northd.h b/northd/northd.h
+index 665ff87bc..f701abd45 100644
+--- a/northd/northd.h
++++ b/northd/northd.h
+@@ -180,7 +180,7 @@ struct route_policy {
+     bool stale;
+ };
+ 
+-struct static_routes_data {
++struct routes_data {
+     struct hmap parsed_routes;
+     struct simap route_tables;
+     struct hmap bfd_active_connections;
+@@ -739,8 +739,8 @@ void build_parsed_routes(struct ovn_datapath *, const struct hmap *,
+                          const struct hmap *, struct hmap *, struct simap *,
+                          struct hmap *);
+ uint32_t get_route_table_id(struct simap *, const char *);
+-void static_routes_init(struct static_routes_data *);
+-void static_routes_destroy(struct static_routes_data *);
++void routes_init(struct routes_data *);
++void routes_destroy(struct routes_data *);
+ 
+ void bfd_init(struct bfd_data *);
+ void bfd_destroy(struct bfd_data *);
+diff --git a/tests/ovn-northd.at b/tests/ovn-northd.at
+index d6a8c4640..63fcf3f71 100644
+--- a/tests/ovn-northd.at
++++ b/tests/ovn-northd.at
+@@ -3904,7 +3904,7 @@ AT_CHECK([ovn-nbctl lr-route-list r0 | grep 192.168.1.2 | grep -q bfd],[0])
+ 
+ check_engine_stats northd recompute nocompute
+ check_engine_stats bfd recompute nocompute
+-check_engine_stats static_routes recompute nocompute
++check_engine_stats routes recompute nocompute
+ check_engine_stats lflow recompute nocompute
+ check_engine_stats northd_output norecompute compute
+ CHECK_NO_CHANGE_AFTER_RECOMPUTE
+@@ -3920,7 +3920,7 @@ AT_CHECK([ovn-nbctl lr-route-list r0 | grep 192.168.5.2 | grep -q bfd],[0])
+ 
+ check_engine_stats northd recompute nocompute
+ check_engine_stats bfd recompute nocompute
+-check_engine_stats static_routes recompute nocompute
++check_engine_stats routes recompute nocompute
+ check_engine_stats lflow recompute nocompute
+ check_engine_stats northd_output norecompute compute
+ CHECK_NO_CHANGE_AFTER_RECOMPUTE
+@@ -3967,7 +3967,7 @@ AT_CHECK([ovn-nbctl list logical_router_policy | grep -q $bfd_route_policy_uuid]
+ 
+ check_engine_stats northd recompute nocompute
+ check_engine_stats bfd recompute nocompute
+-check_engine_stats static_routes recompute nocompute
++check_engine_stats routes recompute nocompute
+ check_engine_stats lflow recompute nocompute
+ check_engine_stats northd_output norecompute compute
+ CHECK_NO_CHANGE_AFTER_RECOMPUTE
+-- 
+2.45.2
+

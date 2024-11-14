@@ -1,0 +1,36 @@
+From 531be90a723f738b1ad8ab2ff04a6413a4bef894 Mon Sep 17 00:00:00 2001
+From: Frode Nordahl <fnordahl@ubuntu.com>
+Date: Mon, 4 Nov 2024 12:04:33 +0100
+Subject: [PATCH 18/31] system-ovn: Remove route without nexthop.
+
+From: Felix Huettner <felix.huettner@stackit.cloud>
+
+for yet unclear reasons some versions of scapy are confused by this
+route. It causes them to log
+"MAC address to reach destination not found. Using broadcast."
+instead of using the dst mac address that is already known by linux.
+It then sends some packets with a broadcast dst mac which are completly
+ignored by ovn. Additionally it seems to attempt arp resolution.
+This slows down the requests long enough that the test runs longer than
+1 second causing multiple packets to get through and failing the test.
+
+Signed-off-by: Felix Huettner <felix.huettner@stackit.cloud>
+---
+ tests/system-ovn.at | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/tests/system-ovn.at b/tests/system-ovn.at
+index 6dfc3055a..cbc9d2e1a 100644
+--- a/tests/system-ovn.at
++++ b/tests/system-ovn.at
+@@ -7502,6 +7502,7 @@ ADD_NAMESPACES(server)
+ NS_CHECK_EXEC([server], [ip link set dev lo up])
+ ADD_VETH(s1, server, br-ext, "172.16.1.50/24", "f0:00:00:01:02:05", \
+          "172.16.1.1")
++NS_CHECK_EXEC([server], [ip route del 172.16.1.1 dev s1])
+ 
+ AT_CHECK([ovs-vsctl set Open_vSwitch . external-ids:ovn-bridge-mappings=phynet:br-ext])
+ check ovn-nbctl lsp-add public public1 \
+-- 
+2.45.2
+

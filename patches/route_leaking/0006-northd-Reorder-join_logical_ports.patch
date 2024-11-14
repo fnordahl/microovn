@@ -1,0 +1,61 @@
+From 978e498de9a2207b96a5c706ec5b71b809a8560b Mon Sep 17 00:00:00 2001
+From: Frode Nordahl <fnordahl@ubuntu.com>
+Date: Mon, 4 Nov 2024 12:04:02 +0100
+Subject: [PATCH 06/31] northd: Reorder join_logical_ports.
+
+From: Felix Huettner <felix.huettner@stackit.cloud>
+
+this makes the later active_active patches clearer as they need this new
+order.
+For now this has no real effect as these two parts are completely
+independent.
+
+Signed-off-by: Felix Huettner <felix.huettner@stackit.cloud>
+Acked-by: Lorenzo Bianconi <lorenzo.bianconi@redhat.com>
+---
+ northd/northd.c | 22 +++++++++++-----------
+ 1 file changed, 11 insertions(+), 11 deletions(-)
+
+diff --git a/northd/northd.c b/northd/northd.c
+index 8d95650c2..5c48503e3 100644
+--- a/northd/northd.c
++++ b/northd/northd.c
+@@ -2365,17 +2365,6 @@ join_logical_ports(const struct sbrec_port_binding_table *sbrec_pb_table,
+     }
+ 
+     struct ovn_datapath *od;
+-    HMAP_FOR_EACH (od, key_node, ls_datapaths) {
+-        ovs_assert(od->nbs);
+-        for (size_t i = 0; i < od->nbs->n_ports; i++) {
+-            const struct nbrec_logical_switch_port *nbsp
+-                = od->nbs->ports[i];
+-            join_logical_ports_lsp(ports, nb_only, both, od, nbsp,
+-                                   nbsp->name, queue_id_bitmap,
+-                                   tag_alloc_table);
+-        }
+-    }
+-
+     struct hmapx dgps = HMAPX_INITIALIZER(&dgps);
+     HMAP_FOR_EACH (od, key_node, lr_datapaths) {
+         ovs_assert(od->nbr);
+@@ -2396,6 +2385,17 @@ join_logical_ports(const struct sbrec_port_binding_table *sbrec_pb_table,
+         }
+     }
+ 
++    HMAP_FOR_EACH (od, key_node, ls_datapaths) {
++        ovs_assert(od->nbs);
++        for (size_t i = 0; i < od->nbs->n_ports; i++) {
++            const struct nbrec_logical_switch_port *nbsp
++                = od->nbs->ports[i];
++            join_logical_ports_lsp(ports, nb_only, both, od, nbsp,
++                                   nbsp->name, queue_id_bitmap,
++                                   tag_alloc_table);
++        }
++    }
++
+     /* Connect logical router ports, and logical switch ports of type "router",
+      * to their peers. */
+     struct ovn_port *op;
+-- 
+2.45.2
+

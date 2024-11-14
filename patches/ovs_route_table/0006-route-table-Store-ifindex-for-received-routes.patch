@@ -1,0 +1,45 @@
+From f5c252c24fdf36f50c8541e405fb73fca242cb92 Mon Sep 17 00:00:00 2001
+From: Frode Nordahl <fnordahl@ubuntu.com>
+Date: Thu, 24 Oct 2024 17:46:38 +0200
+Subject: [PATCH 6/6] route-table: Store ifindex for received routes.
+
+From: Felix Huettner <felix.huettner@stackit.cloud>
+
+Sometimes it is not easily possible to convert the interface index to a
+name. Especially if we run in network namespaces.
+To still be able to act on existing information we also return the
+ifindex now.
+
+Signed-off-by: Felix Huettner <felix.huettner@stackit.cloud>
+---
+ lib/route-table.c | 1 +
+ lib/route-table.h | 1 +
+ 2 files changed, 2 insertions(+)
+
+diff --git a/lib/route-table.c b/lib/route-table.c
+index 80325f6f9..ce70382a4 100644
+--- a/lib/route-table.c
++++ b/lib/route-table.c
+@@ -228,6 +228,7 @@ route_table_add_nexthop(struct route_table_msg *change,
+         }
+     }
+ 
++    nh->ifindex = ifindex;
+     if (ifindex && !if_indextoname(ifindex, nh->ifname)) {
+         int error = errno;
+ 
+diff --git a/lib/route-table.h b/lib/route-table.h
+index f96dbebb3..bcc3205e8 100644
+--- a/lib/route-table.h
++++ b/lib/route-table.h
+@@ -30,6 +30,7 @@
+ 
+ struct route_data_nexthop {
+     struct in6_addr rta_gw;
++    uint32_t ifindex;
+     char ifname[IFNAMSIZ]; /* Interface name. */
+ };
+ 
+-- 
+2.45.2
+

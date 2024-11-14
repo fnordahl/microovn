@@ -1,0 +1,525 @@
+From f1ec85ab0d1944246578dd61a2f3d77ef45236a3 Mon Sep 17 00:00:00 2001
+From: Frode Nordahl <fnordahl@ubuntu.com>
+Date: Mon, 4 Nov 2024 12:04:47 +0100
+Subject: [PATCH 25/31] controller: Watch for route changes.
+
+From: Felix Huettner <felix.huettner@stackit.cloud>
+
+for each vrf/network namespace we use we open a netlink watcher.
+This allows us to reconcile on changed route entries from outside
+routing agents.
+
+Signed-off-by: Felix Huettner <felix.huettner@stackit.cloud>
+---
+ controller/automake.mk               |   7 +-
+ controller/ovn-controller.c          |  48 +++++++++
+ controller/route-exchange-netlink.c  |   8 +-
+ controller/route-exchange-netlink.h  |   2 +
+ controller/route-exchange-stub.c     |   6 --
+ controller/route-exchange.c          |   9 +-
+ controller/route-exchange.h          |   3 +
+ controller/route-table-notify-stub.c |  37 +++++++
+ controller/route-table-notify.c      | 154 +++++++++++++++++++++++++++
+ controller/route-table-notify.h      |  43 ++++++++
+ 10 files changed, 307 insertions(+), 10 deletions(-)
+ create mode 100644 controller/route-table-notify-stub.c
+ create mode 100644 controller/route-table-notify.c
+ create mode 100644 controller/route-table-notify.h
+
+diff --git a/controller/automake.mk b/controller/automake.mk
+index b1bb23e78..6d3bd9b59 100644
+--- a/controller/automake.mk
++++ b/controller/automake.mk
+@@ -51,6 +51,7 @@ controller_ovn_controller_SOURCES = \
+ 	controller/ct-zone.h \
+ 	controller/ct-zone.c \
+ 	controller/route-exchange.h \
++	controller/route-table-notify.h \
+ 	controller/route.h \
+ 	controller/route.c
+ 
+@@ -58,10 +59,12 @@ if HAVE_NETLINK
+ controller_ovn_controller_SOURCES += \
+ 	controller/route-exchange-netlink.h \
+ 	controller/route-exchange-netlink.c \
+-	controller/route-exchange.c
++	controller/route-exchange.c \
++	controller/route-table-notify.c
+ else
+ controller_ovn_controller_SOURCES += \
+-	controller/route-exchange-stub.c
++	controller/route-exchange-stub.c \
++	controller/route-table-notify-stub.c
+ endif
+ 
+ controller_ovn_controller_LDADD = lib/libovn.la $(OVS_LIBDIR)/libopenvswitch.la
+diff --git a/controller/ovn-controller.c b/controller/ovn-controller.c
+index cd14db8de..3091128c7 100644
+--- a/controller/ovn-controller.c
++++ b/controller/ovn-controller.c
+@@ -89,6 +89,7 @@
+ #include "ct-zone.h"
+ #include "route.h"
+ #include "route-exchange.h"
++#include "route-table-notify.h"
+ 
+ VLOG_DEFINE_THIS_MODULE(main);
+ 
+@@ -4968,9 +4969,13 @@ en_route_exchange_run(struct engine_node *node, void *data OVS_UNUSED)
+ 
+     struct route_exchange_ctx_out r_ctx_out = {
+     };
++    hmap_init(&r_ctx_out.route_table_watches);
+ 
+     route_exchange_run(&r_ctx_in, &r_ctx_out);
+ 
++    route_table_notify_update_watches(&r_ctx_out.route_table_watches);
++    hmap_destroy(&r_ctx_out.route_table_watches);
++
+     engine_set_node_state(node, EN_UPDATED);
+ }
+ 
+@@ -4986,6 +4991,38 @@ static void
+ en_route_exchange_cleanup(void *data OVS_UNUSED)
+ {}
+ 
++struct ed_type_route_table_notify {
++    /* For incremental processing this could be tracked per datapath in
++     * the future. */
++    bool changed;
++};
++
++static void
++en_route_table_notify_run(struct engine_node *node, void *data)
++{
++    struct ed_type_route_table_notify *rtn = data;
++    if (rtn->changed) {
++        engine_set_node_state(node, EN_UPDATED);
++    } else {
++        engine_set_node_state(node, EN_UNCHANGED);
++    }
++    rtn->changed = false;
++}
++
++
++static void *
++en_route_table_notify_init(struct engine_node *node OVS_UNUSED,
++                       struct engine_arg *arg OVS_UNUSED)
++{
++    struct ed_type_route_table_notify *rtn = xzalloc(sizeof(*rtn));
++    rtn->changed = true;
++    return rtn;
++}
++
++static void
++en_route_table_notify_cleanup(void *data OVS_UNUSED)
++{}
++
+ /* Returns false if the northd internal version stored in SB_Global
+  * and ovn-controller internal version don't match.
+  */
+@@ -5280,6 +5317,7 @@ main(int argc, char *argv[])
+     ENGINE_NODE(mac_cache, "mac_cache");
+     ENGINE_NODE(bfd_chassis, "bfd_chassis");
+     ENGINE_NODE_WITH_CLEAR_TRACK_DATA(route, "route");
++    ENGINE_NODE(route_table_notify, "route_table_notify");
+     ENGINE_NODE(route_exchange, "route_exchange");
+ 
+ #define SB_NODE(NAME, NAME_STR) ENGINE_NODE_SB(NAME, NAME_STR);
+@@ -5312,6 +5350,7 @@ main(int argc, char *argv[])
+     engine_add_input(&en_route, &en_sb_route,
+                      engine_noop_handler);
+     engine_add_input(&en_route_exchange, &en_route, NULL);
++    engine_add_input(&en_route_exchange, &en_route_table_notify, NULL);
+     engine_add_input(&en_route_exchange, &en_sb_route,
+                      engine_noop_handler);
+ 
+@@ -5816,6 +5855,14 @@ main(int argc, char *argv[])
+                                &transport_zones,
+                                bridge_table);
+ 
++                    if (route_table_notify_run()) {
++                        struct ed_type_route_table_notify *rtn =
++                            engine_get_internal_data(&en_route_table_notify);
++                        if (rtn) {
++                            rtn->changed = true;
++                        }
++                    }
++
+                     stopwatch_start(CONTROLLER_LOOP_STOPWATCH_NAME,
+                                     time_msec());
+                     if (ovnsb_idl_txn) {
+@@ -6092,6 +6139,7 @@ main(int argc, char *argv[])
+             }
+ 
+             binding_wait();
++            route_table_notify_wait();
+         }
+ 
+         unixctl_server_run(unixctl);
+diff --git a/controller/route-exchange-netlink.c b/controller/route-exchange-netlink.c
+index f2d72c3a7..284161144 100644
+--- a/controller/route-exchange-netlink.c
++++ b/controller/route-exchange-netlink.c
+@@ -252,6 +252,12 @@ handle_route_msg_delete_routes(const struct route_table_msg *msg, void *data)
+     }
+ }
+ 
++char *
++re_nl_get_netns_name(uint32_t table_id)
++{
++    return xasprintf("ovnns%d", table_id);
++}
++
+ void
+ re_nl_sync_routes(uint32_t table_id,
+                   const struct hmap *routes, struct hmap *learned_routes,
+@@ -260,7 +266,7 @@ re_nl_sync_routes(uint32_t table_id,
+ 
+     char * netns = NULL;
+     if (use_netns) {
+-        netns = xasprintf("ovnns%d", table_id);
++        netns = re_nl_get_netns_name(table_id);
+         table_id = RT_TABLE_MAIN;
+     }
+ 
+diff --git a/controller/route-exchange-netlink.h b/controller/route-exchange-netlink.h
+index 11f989cf6..5d48cbfd7 100644
+--- a/controller/route-exchange-netlink.h
++++ b/controller/route-exchange-netlink.h
+@@ -34,6 +34,8 @@ struct re_nl_received_route_node {
+     struct in6_addr nexthop;
+ };
+ 
++char * re_nl_get_netns_name(uint32_t table_id);
++
+ int re_nl_create_vrf(const char *ifname, uint32_t table_id);
+ int re_nl_delete_vrf(const char *ifname);
+ 
+diff --git a/controller/route-exchange-stub.c b/controller/route-exchange-stub.c
+index 2ca644b06..7225e67a8 100644
+--- a/controller/route-exchange-stub.c
++++ b/controller/route-exchange-stub.c
+@@ -19,12 +19,6 @@
+ #include "openvswitch/compiler.h"
+ #include "route-exchange.h"
+ 
+-bool
+-route_exchange_relevant_port(const struct sbrec_port_binding *pb OVS_UNUSED)
+-{
+-    return false;
+-}
+-
+ void
+ route_exchange_run(struct route_exchange_ctx_in *r_ctx_in OVS_UNUSED,
+                    struct route_exchange_ctx_out *r_ctx_out OVS_UNUSED)
+diff --git a/controller/route-exchange.c b/controller/route-exchange.c
+index a5a5afee5..12204e42a 100644
+--- a/controller/route-exchange.c
++++ b/controller/route-exchange.c
+@@ -25,6 +25,7 @@
+ #include "ha-chassis.h"
+ #include "local_data.h"
+ #include "route.h"
++#include "route-table-notify.h"
+ #include "route-exchange.h"
+ #include "route-exchange-netlink.h"
+ 
+@@ -169,7 +170,7 @@ sb_sync_learned_routes(const struct sbrec_datapath_binding *datapath,
+ 
+ void
+ route_exchange_run(struct route_exchange_ctx_in *r_ctx_in,
+-                   struct route_exchange_ctx_out *r_ctx_out OVS_UNUSED)
++                   struct route_exchange_ctx_out *r_ctx_out)
+ {
+     struct sset old_maintained_vrfs = SSET_INITIALIZER(&old_maintained_vrfs);
+     sset_swap(&_maintained_vrfs, &old_maintained_vrfs);
+@@ -203,6 +204,12 @@ route_exchange_run(struct route_exchange_ctx_in *r_ctx_in,
+                                r_ctx_in->ovnsb_idl_txn,
+                                r_ctx_in->sbrec_route_by_datapath);
+ 
++        struct route_table_watch_request *wr = xzalloc(sizeof(*wr));
++        wr->table_id = ad->key;
++        wr->is_netns = ad->use_netns;
++        hmap_insert(&r_ctx_out->route_table_watches, &wr->node,
++                    route_table_notify_hash_watch(wr->table_id, wr->is_netns));
++
+ out:
+         re_nl_received_routes_destroy(&received_routes);
+     }
+diff --git a/controller/route-exchange.h b/controller/route-exchange.h
+index d19e83403..986194e81 100644
+--- a/controller/route-exchange.h
++++ b/controller/route-exchange.h
+@@ -16,6 +16,7 @@
+ #define ROUTE_EXCHANGE_H 1
+ 
+ #include <stdbool.h>
++#include "openvswitch/hmap.h"
+ 
+ struct route_exchange_ctx_in {
+     struct ovsdb_idl_txn *ovnsb_idl_txn;
+@@ -25,6 +26,8 @@ struct route_exchange_ctx_in {
+ };
+ 
+ struct route_exchange_ctx_out {
++    /* contains route_table_watch */
++    struct hmap route_table_watches;
+ };
+ 
+ void route_exchange_run(struct route_exchange_ctx_in *,
+diff --git a/controller/route-table-notify-stub.c b/controller/route-table-notify-stub.c
+new file mode 100644
+index 000000000..d6de9852e
+--- /dev/null
++++ b/controller/route-table-notify-stub.c
+@@ -0,0 +1,37 @@
++/*
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at:
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include <config.h>
++
++#include <stdbool.h>
++
++#include "openvswitch/compiler.h"
++#include "route-table-notify.h"
++
++bool
++route_table_notify_run(void)
++{
++    return false;
++}
++
++void
++route_table_notify_wait(void)
++{
++}
++
++void
++route_table_notify_update_watches(struct hmap *route_table_watches OVS_UNUSED)
++{
++}
++
+diff --git a/controller/route-table-notify.c b/controller/route-table-notify.c
+new file mode 100644
+index 000000000..fcfd833fd
+--- /dev/null
++++ b/controller/route-table-notify.c
+@@ -0,0 +1,154 @@
++/*
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at:
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include <config.h>
++
++#include <net/if.h>
++#include <linux/rtnetlink.h>
++
++#include "netlink-notifier.h"
++#include "openvswitch/vlog.h"
++
++#include "binding.h"
++#include "route-table.h"
++#include "route.h"
++#include "route-table-notify.h"
++#include "route-exchange-netlink.h"
++
++
++VLOG_DEFINE_THIS_MODULE(route_table_notify);
++
++struct route_table_watch_entry {
++    struct hmap_node node;
++    uint32_t table_id;
++    bool is_netns;
++    struct nln *nln;
++    struct nln_notifier *route_notifier;
++    struct nln_notifier *route6_notifier;
++    /* used in update_watches to ensure we clean up */
++    bool stale;
++};
++
++static struct hmap watches = HMAP_INITIALIZER(&watches);
++static bool any_route_table_changed = false;
++static struct route_table_msg rtmsg;
++
++static struct route_table_watch_entry*
++find_watch_entry(uint32_t table_id, bool is_netns)
++{
++    struct route_table_watch_entry *we;
++    uint32_t hash = route_table_notify_hash_watch(table_id, is_netns);
++    HMAP_FOR_EACH_WITH_HASH (we, node, hash, &watches) {
++        if (table_id == we->table_id && is_netns == we->is_netns) {
++            return we;
++        }
++    }
++    return NULL;
++}
++
++static void
++route_table_change(const struct route_table_msg *change OVS_UNUSED,
++                   void *aux OVS_UNUSED)
++{
++    if (change && change->rd.rtm_protocol != RTPROT_OVN) {
++        any_route_table_changed = true;
++    }
++}
++
++static void
++add_watch_entry(uint32_t table_id, bool is_netns)
++{
++    struct route_table_watch_entry *we;
++    uint32_t hash = route_table_notify_hash_watch(table_id, is_netns);
++    we = xzalloc(sizeof(*we));
++    we->table_id = table_id;
++    we->is_netns = is_netns;
++    we->stale = false;
++    char *netns = NULL;
++    if (is_netns) {
++        netns = re_nl_get_netns_name(table_id);
++    }
++    VLOG_DBG("registering new route table watcher for table %d and netns %s",
++             table_id, netns);
++    we->nln = nln_create(netns, NETLINK_ROUTE, route_table_parse, &rtmsg);
++    free(netns);
++
++    we->route_notifier =
++        nln_notifier_create(we->nln, RTNLGRP_IPV4_ROUTE,
++                            (nln_notify_func *) route_table_change, NULL);
++    we->route6_notifier =
++        nln_notifier_create(we->nln, RTNLGRP_IPV6_ROUTE,
++                            (nln_notify_func *) route_table_change, NULL);
++    hmap_insert(&watches, &we->node, hash);
++}
++
++static void
++remove_watch_entry(struct route_table_watch_entry *we)
++{
++    hmap_remove(&watches, &we->node);
++    nln_notifier_destroy(we->route_notifier);
++    nln_notifier_destroy(we->route6_notifier);
++    nln_destroy(we->nln);
++    free(we);
++}
++
++bool
++route_table_notify_run(void)
++{
++    any_route_table_changed = false;
++
++    struct route_table_watch_entry *we;
++    HMAP_FOR_EACH (we, node, &watches) {
++        nln_run(we->nln);
++    }
++
++    return any_route_table_changed;
++}
++
++void
++route_table_notify_wait(void)
++{
++    struct route_table_watch_entry *we;
++    HMAP_FOR_EACH (we, node, &watches) {
++        nln_wait(we->nln);
++    }
++}
++
++void
++route_table_notify_update_watches(struct hmap *route_table_watches)
++{
++    struct route_table_watch_entry *we;
++    HMAP_FOR_EACH (we, node, &watches) {
++        we->stale = true;
++    }
++
++    struct route_table_watch_request *wr;
++    HMAP_FOR_EACH_SAFE (wr, node, route_table_watches) {
++        we = find_watch_entry(wr->table_id, wr->is_netns);
++        if (we) {
++            we->stale = false;
++        } else {
++            add_watch_entry(wr->table_id, wr->is_netns);
++        }
++        hmap_remove(route_table_watches, &wr->node);
++        free(wr);
++    }
++
++    HMAP_FOR_EACH_SAFE (we, node, &watches) {
++        if (we->stale) {
++            remove_watch_entry(we);
++        }
++    }
++
++}
+diff --git a/controller/route-table-notify.h b/controller/route-table-notify.h
+new file mode 100644
+index 000000000..4fdbc0366
+--- /dev/null
++++ b/controller/route-table-notify.h
+@@ -0,0 +1,43 @@
++/*
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at:
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef ROUTE_TABLE_NOTIFY_H
++#define ROUTE_TABLE_NOTIFY_H 1
++
++#include <stdbool.h>
++#include "openvswitch/hmap.h"
++#include "hash.h"
++
++struct route_table_watch_request {
++    struct hmap_node node;
++    uint32_t table_id;
++    bool is_netns;
++};
++
++static inline uint32_t
++route_table_notify_hash_watch(uint32_t table_id, bool is_netns)
++{
++    uint32_t hash = hash_add(0, table_id);
++    return hash_boolean(is_netns, hash);
++}
++
++/* returns true if any route table has changed enough that we need to learn
++ * new routes. */
++bool route_table_notify_run(void);
++void route_table_notify_wait(void);
++/* updates the list of route table watches that are currently active.
++ * hmap should contain struct route_table_watch_request */
++void route_table_notify_update_watches(struct hmap *route_table_watches);
++
++#endif /* ROUTE_TABLE_NOTIFY_H */
+-- 
+2.45.2
+

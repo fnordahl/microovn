@@ -1,0 +1,38 @@
+From 3b426d74d0ba3e0da6f2881d778c3f1c6ce6b566 Mon Sep 17 00:00:00 2001
+From: Frode Nordahl <fnordahl@ubuntu.com>
+Date: Mon, 4 Nov 2024 12:04:10 +0100
+Subject: [PATCH 10/31] northd: Routing-protocol-redirect on crps.
+
+From: Felix Huettner <felix.huettner@stackit.cloud>
+
+previously we prevented using the routing-protocol-redirect option on
+chassis-redirect ports. However the option works fine there, therefor we
+remove the limitation.
+
+Signed-off-by: Felix Huettner <felix.huettner@stackit.cloud>
+---
+ northd/northd.c | 8 --------
+ 1 file changed, 8 deletions(-)
+
+diff --git a/northd/northd.c b/northd/northd.c
+index 7a8148b13..c25c501d9 100644
+--- a/northd/northd.c
++++ b/northd/northd.c
+@@ -14196,14 +14196,6 @@ build_lrouter_routing_protocol_redirect(
+         return;
+     }
+ 
+-    if (op->cr_port) {
+-        static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 5);
+-        VLOG_WARN_RL(&rl, "Option 'routing-protocol-redirect' is not "
+-                          "supported on Distributed Gateway Port '%s'",
+-                          op->key);
+-        return;
+-    }
+-
+     /* Ensure that LSP, to which the routing protocol traffic is redirected,
+      * exists. */
+     struct ovn_port *lsp_in_peer = ovn_port_find(ls_ports,
+-- 
+2.45.2
+
